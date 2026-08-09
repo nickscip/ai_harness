@@ -11,6 +11,13 @@ from .profiles import load_profile_catalog
 Family = Literal["claude", "codex"]
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class HarnessConfig:
     primary_family: Family = "claude"
@@ -26,6 +33,12 @@ class HarnessConfig:
     claude_max_budget_usd: float = 8.0
     max_pr_files: int = 300
     max_pr_lines: int = 100_000
+    slack_enabled: bool = False
+    slack_user: str = ""
+    slack_wait_seconds: int = 1_800
+    slack_budget_usd: float = 5.0
+    slack_max_clarifications: int = 3
+    slack_poll_seconds: int = 20
 
     @classmethod
     def from_env(
@@ -36,6 +49,8 @@ class HarnessConfig:
         claude_model: str | None = None,
         codex_model: str | None = None,
         profile: str | None = None,
+        slack: bool | None = None,
+        slack_wait: int | None = None,
     ) -> HarnessConfig:
         catalog = load_profile_catalog()
         selected = catalog.select(profile or os.getenv("AI_HARNESS_PROFILE"))
@@ -81,6 +96,20 @@ class HarnessConfig:
             ),
             max_pr_files=int(os.getenv("AI_HARNESS_MAX_PR_FILES", "300")),
             max_pr_lines=int(os.getenv("AI_HARNESS_MAX_PR_LINES", "100000")),
+            slack_enabled=(
+                slack if slack is not None else _env_flag("AI_HARNESS_SLACK", False)
+            ),
+            slack_user=os.getenv("AI_HARNESS_SLACK_USER", ""),
+            slack_wait_seconds=(
+                slack_wait
+                if slack_wait is not None
+                else int(os.getenv("AI_HARNESS_SLACK_WAIT", "1800"))
+            ),
+            slack_budget_usd=float(os.getenv("AI_HARNESS_SLACK_BUDGET_USD", "5")),
+            slack_max_clarifications=int(
+                os.getenv("AI_HARNESS_SLACK_MAX_CLARIFICATIONS", "3")
+            ),
+            slack_poll_seconds=int(os.getenv("AI_HARNESS_SLACK_POLL_SECONDS", "20")),
         )
 
     def model_for(self, family: Family) -> str:

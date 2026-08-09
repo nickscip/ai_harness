@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "found": {"type": "boolean"},
+    "channel_id": {"type": "string"},
+    "message_ts": {"type": "string"},
+    "thread_ts": {"type": "string"},
+    "sender_id": {"type": "string"},
+    "text": {"type": "string"},
+    "error": {"type": "string"}
+  },
+  "required": [
+    "found",
+    "channel_id",
+    "message_ts",
+    "thread_ts",
+    "sender_id",
+    "text",
+    "error"
+  ]
+}

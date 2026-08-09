@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -21,13 +23,26 @@ from .prompts import (
     task_implementation_prompt,
     task_implementation_repair_prompt,
     task_plan_answer_prompt,
+    task_plan_clarify_prompt,
     task_plan_prompt,
     task_review_prompt,
     task_revise_prompt,
 )
 from .providers import ProviderRequest, ProviderRunner
 from .schema import validate_output, validate_plan, validate_plan_review, validate_revised_plan
-from .state import RunStore, new_run_id
+from .slack import (
+    ChannelBudget,
+    ChannelError,
+    QuestionChannel,
+    Receipt,
+    Routing,
+    build_question_channel,
+    classify_reply,
+    parse_ts,
+    reject_reason,
+    truncate_reply,
+)
+from .state import RunStore, new_run_id, sha256_bytes
 
 
 def start_task(
@@ -62,6 +77,12 @@ def start_task(
             "codex_reasoning": config.codex_reasoning,
             "claude_max_budget_usd": config.claude_max_budget_usd,
             "deliver": deliver,
+            "slack_enabled": config.slack_enabled,
+            "slack_user": config.slack_user,
+            "slack_wait_seconds": config.slack_wait_seconds,
+            "slack_budget_usd": config.slack_budget_usd,
+            "slack_max_clarifications": config.slack_max_clarifications,
+            "slack_poll_seconds": config.slack_poll_seconds,
         },
         progress=progress,
     )
@@ -107,10 +128,231 @@ def start_task(
     return store
 
 
+MAX_IGNORED_SLACK_MESSAGES = 10
+
+
+def _question_fingerprint(questions: list[dict[str, Any]]) -> str:
+    return sha256_bytes(json.dumps(questions, sort_keys=True).encode("utf-8"))
+
+
+def _question_message(question: dict[str, Any], *, run_id: str, position: str) -> str:
+    default = question.get("suggested_default") or ""
+    lines = [
+        f"*ai-harness needs a decision* ({position})",
+        f"`[ai-harness {run_id} {question['id']}]`",
+        "",
+        question["question"],
+        "",
+        f"_Why this blocks planning:_ {question['why_blocking']}",
+    ]
+    if default.strip():
+        lines.append(f"_Suggested default:_ {default}")
+    lines.extend(
+        [
+            "",
+            "Reply with your decision. Prefix `q:` to ask me something first, "
+            "`a:` to force a reply to count as the answer, or send `cancel` to "
+            "answer from the terminal instead.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _slack_binding(state: dict[str, Any], stage: str, round_number: int, questions: list) -> dict:
+    """Bind progress to the exact pending question set.
+
+    A later planning round may legitimately reuse Q001, and answer validation matches on ID alone,
+    so progress carrying a stale answer must never be applied to a different question.
+    """
+    stage_record = state.get("stages", {}).get(stage, {})
+    return {
+        "round": round_number,
+        "stage": stage,
+        "artifact_sha256": stage_record.get("sha256", ""),
+        "question_hash": _question_fingerprint(questions),
+    }
+
+
+def _slack_answers(
+    *,
+    store: RunStore,
+    runner: ProviderRunner,
+    config: HarnessConfig,
+    channel: QuestionChannel,
+    primary: str,
+    worktree: Path,
+    context: str,
+    context_dirs: tuple[Path, ...],
+    questions: list[dict[str, Any]],
+    stage: str,
+    round_number: int,
+) -> dict[str, str] | None:
+    """Run the Slack conversation for one pending question set.
+
+    Returns a complete answer dict, or None to fall back to the manual `resume --answer` path.
+    Every send and every accepted reply is persisted before the next network call, so a crash
+    resumes at the unanswered question rather than re-asking or losing an answer.
+    """
+    state = store.load()
+    binding = _slack_binding(state, stage, round_number, questions)
+    progress = state.get("slack_progress")
+    if not isinstance(progress, dict) or {k: progress.get(k) for k in binding} != binding:
+        if isinstance(progress, dict):
+            store.log("Discarding Slack progress bound to a different planning question set")
+        progress = {
+            **binding,
+            "channel_id": "",
+            "question_id": "",
+            "receipt_ts": "",
+            "outbound_ts": [],
+            "cursor_ts": "",
+            "answers": {},
+            "deadline_epoch": time.time() + config.slack_wait_seconds,
+            "clarifications": 0,
+        }
+
+    def save() -> None:
+        current = store.load()
+        current["slack_progress"] = progress
+        store.save(current)
+
+    save()
+
+    for index, question in enumerate(questions):
+        identifier = str(question["id"])
+        if identifier in progress["answers"]:
+            continue
+        position = f"question {index + 1} of {len(questions)}"
+
+        if progress["question_id"] != identifier or not progress["receipt_ts"]:
+            receipt = channel.post_question(
+                _question_message(question, run_id=store.run_id, position=position)
+            )
+            progress["question_id"] = identifier
+            progress["channel_id"] = receipt.channel_id
+            progress["receipt_ts"] = receipt.message_ts
+            progress["outbound_ts"] = [*progress["outbound_ts"], receipt.message_ts]
+            progress["cursor_ts"] = receipt.message_ts
+            progress["clarifications"] = 0
+            save()
+            store.log(f"Asked {identifier} on Slack; waiting for a reply")
+        else:
+            receipt = Receipt(
+                channel_id=str(progress["channel_id"]),
+                message_ts=str(progress["receipt_ts"]),
+            )
+            store.log(f"Resuming the Slack wait for {identifier}")
+
+        channel.set_outbound(progress["outbound_ts"])
+        ignored = 0
+        while True:
+            remaining = float(progress["deadline_epoch"]) - time.time()
+            if remaining <= 0:
+                store.log("Slack wait budget expired before an answer arrived")
+                return None
+            message = channel.wait_for_reply(
+                receipt,
+                after_ts=str(progress["cursor_ts"]),
+                deadline=time.monotonic() + remaining,
+            )
+            if message is None:
+                store.log("Slack wait ended without a reply")
+                return None
+
+            reason = reject_reason(
+                message,
+                receipt=receipt,
+                cursor_ts=str(progress["cursor_ts"]),
+                outbound_ts=progress["outbound_ts"],
+                target_sender=config.slack_user,
+            )
+            if reason is not None:
+                ignored += 1
+                store.log(f"Ignoring a Slack message: {reason}")
+                if parse_ts(message.message_ts) > parse_ts(str(progress["cursor_ts"])):
+                    progress["cursor_ts"] = message.message_ts
+                    save()
+                if ignored >= MAX_IGNORED_SLACK_MESSAGES:
+                    store.log("Too many unusable Slack messages; falling back to manual input")
+                    return None
+                continue
+
+            progress["cursor_ts"] = message.message_ts
+            save()
+            routed = classify_reply(truncate_reply(message.text))
+
+            if routed.routing is Routing.CANCEL:
+                store.log("Slack conversation cancelled; falling back to manual input")
+                return None
+
+            if routed.routing is Routing.ANSWER:
+                if not routed.text.strip():
+                    continue
+                progress["answers"] = {**progress["answers"], identifier: routed.text}
+                progress["question_id"] = ""
+                progress["receipt_ts"] = ""
+                save()
+                store.log(f"Collected the Slack answer for {identifier}")
+                break
+
+            if progress["clarifications"] >= config.slack_max_clarifications:
+                notice = (
+                    "That's my clarification limit for this question. Reply with your decision, "
+                    "or answer from the terminal with `ai-harness resume`."
+                )
+                sent = channel.post_reply(receipt, notice)
+                progress["outbound_ts"] = [*progress["outbound_ts"], sent.message_ts]
+                save()
+                store.log("Slack clarification limit reached; falling back to manual input")
+                return None
+
+            progress["clarifications"] = int(progress["clarifications"]) + 1
+            save()
+            clarify_stage = f"clarify-r{round_number}-{identifier}-{progress['clarifications']}"
+            clarification = store.read_completed_stage(clarify_stage)
+            if clarification is None:
+                clarification = runner.run(
+                    ProviderRequest(
+                        family=primary,
+                        stage=clarify_stage,
+                        cwd=worktree,
+                        prompt=task_plan_clarify_prompt(
+                            str(store.load()["prompt"]),
+                            store.root / f"{stage}.json",
+                            {
+                                "id": identifier,
+                                "question": str(question["question"]),
+                                "why_blocking": str(question["why_blocking"]),
+                                "suggested_default": str(question.get("suggested_default", "")),
+                            },
+                            routed.text,
+                            context,
+                        ),
+                        schema_name="clarification",
+                        writable=False,
+                        timeout=config.stage_timeout,
+                        context_dirs=(*context_dirs, store.root),
+                    )
+                )
+            else:
+                validate_output("clarification", clarification)
+
+            sent = channel.post_reply(receipt, str(clarification["answer"]))
+            progress["outbound_ts"] = [*progress["outbound_ts"], sent.message_ts]
+            if parse_ts(sent.message_ts) > parse_ts(str(progress["cursor_ts"])):
+                progress["cursor_ts"] = sent.message_ts
+            save()
+            channel.set_outbound(progress["outbound_ts"])
+
+    return {str(key): str(value) for key, value in progress["answers"].items()}
+
+
 def _resolve_plan(
     *,
     store: RunStore,
     runner: ProviderRunner,
+    config: HarnessConfig,
+    channel: QuestionChannel | None,
     primary: str,
     worktree: Path,
     context: str,
@@ -118,121 +360,147 @@ def _resolve_plan(
     timeout: int,
     answers: dict[str, str] | None,
 ) -> tuple[dict[str, Any], Path]:
-    state = store.load()
-    pending = state.get("pending_input")
-    if pending:
-        questions = pending["questions"]
-        if answers is None:
-            store.log(f"Planning is paused for {len(questions)} human answer(s)")
-            raise AwaitingInput(store.run_id, questions)
-        expected = {item["id"] for item in questions}
-        provided = set(answers)
-        missing = sorted(expected - provided)
-        extra = sorted(provided - expected)
-        blank = sorted(identifier for identifier, answer in answers.items() if not answer.strip())
-        if missing or extra or blank:
-            raise HarnessError(
-                "Answers do not match pending questions "
-                f"(missing={missing}, extra={extra}, blank={blank})"
+    while True:
+        state = store.load()
+        pending = state.get("pending_input")
+        if pending:
+            questions = pending["questions"]
+            if answers is None and channel is not None:
+                try:
+                    answers = _slack_answers(
+                        store=store,
+                        runner=runner,
+                        config=config,
+                        channel=channel,
+                        primary=primary,
+                        worktree=worktree,
+                        context=context,
+                        context_dirs=context_dirs,
+                        questions=questions,
+                        stage=str(pending["stage"]),
+                        round_number=int(pending["round"]),
+                    )
+                except ChannelError as exc:
+                    # Every channel failure class degrades to the documented manual path.
+                    store.log(f"Slack question channel unavailable: {exc}")
+                    answers = None
+            if answers is None:
+                store.log(f"Planning is paused for {len(questions)} human answer(s)")
+                raise AwaitingInput(store.run_id, questions)
+            expected = {item["id"] for item in questions}
+            provided = set(answers)
+            missing = sorted(expected - provided)
+            extra = sorted(provided - expected)
+            blank = sorted(key for key, answer in answers.items() if not answer.strip())
+            if missing or extra or blank:
+                raise HarnessError(
+                    "Answers do not match pending questions "
+                    f"(missing={missing}, extra={extra}, blank={blank})"
+                )
+            history = list(state.get("human_answers", []))
+            history.append(
+                {
+                    "round": pending["round"],
+                    "questions": questions,
+                    "answers": answers,
+                }
             )
-        history = list(state.get("human_answers", []))
-        history.append(
-            {
-                "round": pending["round"],
-                "questions": questions,
-                "answers": answers,
-            }
-        )
+            state.update(
+                {
+                    "status": "running",
+                    "pending_input": None,
+                    "human_answers": history,
+                    "planning_round": int(pending["round"]) + 1,
+                    "planning_base_artifact": pending["artifact"],
+                    "planning_answers": answers,
+                    # Progress is cleared with the answers it produced, so a later round that
+                    # reuses a question ID can never inherit this round's reply.
+                    "slack_progress": None,
+                }
+            )
+            store.save(state)
+            answers = None
+        elif answers:
+            raise HarnessError("This run has no pending planning questions")
+
+        state = store.load()
+        active_stage = state.get("active_plan_stage")
+        if active_stage:
+            active = store.read_completed_stage(active_stage)
+            if active is None:
+                raise HarnessError(f"Active planning artifact is incomplete: {active_stage}")
+            validate_output("plan", active)
+            validate_plan(active)
+            return active, store.root / f"{active_stage}.json"
+
+        round_number = int(state.get("planning_round", 1))
+        stage = "plan" if round_number == 1 else f"plan-r{round_number}"
+        plan = store.read_completed_stage(stage)
+        if plan is None:
+            if round_number == 1:
+                prompt = task_plan_prompt(state["prompt"], context)
+                stage_context_dirs = context_dirs
+            else:
+                base_artifact = state.get("planning_base_artifact")
+                planning_answers = state.get("planning_answers")
+                if not base_artifact or not isinstance(planning_answers, dict):
+                    raise HarnessError("Answered planning state is incomplete")
+                prompt = task_plan_answer_prompt(
+                    state["prompt"],
+                    store.root / base_artifact,
+                    planning_answers,
+                    context,
+                )
+                stage_context_dirs = (*context_dirs, store.root)
+            plan = runner.run(
+                ProviderRequest(
+                    family=primary,
+                    stage=stage,
+                    cwd=worktree,
+                    prompt=prompt,
+                    schema_name="plan",
+                    writable=False,
+                    timeout=timeout,
+                    context_dirs=stage_context_dirs,
+                )
+            )
+        else:
+            validate_output("plan", plan)
+        validate_plan(plan)
+        verify_references(store.load())
+
+        questions = plan["questions"]
+        if questions:
+            state = store.load()
+            state.update(
+                {
+                    "status": "awaiting_input",
+                    "planning_round": round_number,
+                    "pending_input": {
+                        "round": round_number,
+                        "stage": stage,
+                        "artifact": f"{stage}.json",
+                        "questions": questions,
+                    },
+                }
+            )
+            store.save(state)
+            store.log(f"Planning requested {len(questions)} blocking human answer(s); pausing")
+            # Loop back so the pending branch above is the one place that either resolves the
+            # questions over Slack or raises AwaitingInput. One answer-application path.
+            continue
+
+        state = store.load()
         state.update(
             {
                 "status": "running",
                 "pending_input": None,
-                "human_answers": history,
-                "planning_round": int(pending["round"]) + 1,
-                "planning_base_artifact": pending["artifact"],
-                "planning_answers": answers,
+                "active_plan_stage": stage,
+                "active_plan_artifact": f"{stage}.json",
             }
         )
         store.save(state)
-    elif answers:
-        raise HarnessError("This run has no pending planning questions")
-
-    state = store.load()
-    active_stage = state.get("active_plan_stage")
-    if active_stage:
-        active = store.read_completed_stage(active_stage)
-        if active is None:
-            raise HarnessError(f"Active planning artifact is incomplete: {active_stage}")
-        validate_output("plan", active)
-        validate_plan(active)
-        return active, store.root / f"{active_stage}.json"
-
-    round_number = int(state.get("planning_round", 1))
-    stage = "plan" if round_number == 1 else f"plan-r{round_number}"
-    plan = store.read_completed_stage(stage)
-    if plan is None:
-        if round_number == 1:
-            prompt = task_plan_prompt(state["prompt"], context)
-            stage_context_dirs = context_dirs
-        else:
-            base_artifact = state.get("planning_base_artifact")
-            planning_answers = state.get("planning_answers")
-            if not base_artifact or not isinstance(planning_answers, dict):
-                raise HarnessError("Answered planning state is incomplete")
-            prompt = task_plan_answer_prompt(
-                state["prompt"],
-                store.root / base_artifact,
-                planning_answers,
-                context,
-            )
-            stage_context_dirs = (*context_dirs, store.root)
-        plan = runner.run(
-            ProviderRequest(
-                family=primary,
-                stage=stage,
-                cwd=worktree,
-                prompt=prompt,
-                schema_name="plan",
-                writable=False,
-                timeout=timeout,
-                context_dirs=stage_context_dirs,
-            )
-        )
-    else:
-        validate_output("plan", plan)
-    validate_plan(plan)
-    verify_references(store.load())
-
-    questions = plan["questions"]
-    if questions:
-        state = store.load()
-        state.update(
-            {
-                "status": "awaiting_input",
-                "planning_round": round_number,
-                "pending_input": {
-                    "round": round_number,
-                    "stage": stage,
-                    "artifact": f"{stage}.json",
-                    "questions": questions,
-                },
-            }
-        )
-        store.save(state)
-        store.log(f"Planning requested {len(questions)} blocking human answer(s); pausing")
-        raise AwaitingInput(store.run_id, questions)
-
-    state = store.load()
-    state.update(
-        {
-            "status": "running",
-            "pending_input": None,
-            "active_plan_stage": stage,
-            "active_plan_artifact": f"{stage}.json",
-        }
-    )
-    store.save(state)
-    return plan, store.root / f"{stage}.json"
+        return plan, store.root / f"{stage}.json"
 
 
 def _delivery_title(summary: str) -> str:
@@ -439,9 +707,29 @@ def execute_task(
     context_dirs = (context_dir,) if context_dir.is_dir() else ()
     git_admin = repo.git_admin_dir(worktree)
 
+    def record_spend(total: float) -> None:
+        current = store.load()
+        current["slack_spent_usd"] = total
+        store.save(current)
+
+    # Spend is tracked run-wide and outside slack_progress: `--max-budget-usd` is a per-process
+    # cap, and discarding progress for a new question set must not also reset the allowance.
+    budget = ChannelBudget(
+        limit_usd=config.slack_budget_usd,
+        spent_usd=float(state.get("slack_spent_usd", 0.0)),
+        on_spend=record_spend,
+    )
+    try:
+        channel = build_question_channel(config, store, budget=budget)
+    except ChannelError as exc:
+        store.log(f"Slack question channel unavailable: {exc}")
+        channel = None
+
     plan, plan_path = _resolve_plan(
         store=store,
         runner=runner,
+        config=config,
+        channel=channel,
         primary=primary,
         worktree=worktree,
         context=context,
