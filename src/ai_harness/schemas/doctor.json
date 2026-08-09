@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "provider": {"type": "string", "enum": ["claude", "codex"]},
+    "ok": {"type": "boolean", "const": true},
+    "message": {"type": "string", "minLength": 1}
+  },
+  "required": ["provider", "ok", "message"]
+}

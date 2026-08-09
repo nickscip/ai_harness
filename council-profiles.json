@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "default_profile": "codex-balanced",
+  "profiles": {
+    "codex-fast": {
+      "description": "Low-effort Codex reviews for prompt development and quick checks.",
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "effort": "low",
+      "timeout_seconds": 300
+    },
+    "codex-balanced": {
+      "description": "Default Codex workflow with medium reasoning effort.",
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "effort": "medium",
+      "timeout_seconds": 900
+    },
+    "codex-deep": {
+      "description": "High-effort Codex workflow for risky or broad changes.",
+      "provider": "codex",
+      "model": "gpt-5.6-sol",
+      "effort": "high",
+      "timeout_seconds": 900
+    },
+    "claude-sonnet": {
+      "description": "Sonnet workflow using the developer's saved Claude Code login.",
+      "provider": "claude",
+      "model": "sonnet",
+      "effort": "medium",
+      "timeout_seconds": 900
+    },
+    "claude-opus": {
+      "description": "Opus workflow for difficult implementation and review tasks.",
+      "provider": "claude",
+      "model": "opus",
+      "fallback_model": "sonnet",
+      "effort": "high",
+      "timeout_seconds": 900
+    },
+    "nightly-opus": {
+      "description": "Long-form Opus workflow intended for the overnight credit window.",
+      "provider": "claude",
+      "model": "opus",
+      "fallback_model": "sonnet",
+      "effort": "max",
+      "timeout_seconds": 1200
+    }
+  }
+}
