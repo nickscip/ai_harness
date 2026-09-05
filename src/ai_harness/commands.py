@@ -31,7 +31,7 @@ _ALLOWED_GIT_VERIFY = {"diff", "status", "grep", "show"}
 _ALLOWED_GIT_PREPARE = {"submodule", "lfs"}
 _FORBIDDEN_ARGUMENTS = {"-c", "--eval", "-e"}
 _COREPACK_MANAGERS = {"pnpm", "yarn"}
-_INTERPRETER_FALLBACKS = {"python": "python3", "python3": "python"}
+_INTERPRETER_FALLBACKS = {"python": "python3"}
 
 
 def validate_planned_command(command: dict[str, Any], *, preparation: bool) -> list[str]:
@@ -63,7 +63,7 @@ def validate_plan_commands(plan: dict[str, Any]) -> None:
 
 
 def resolve_controller_argv(argv: list[str], env: dict[str, str]) -> list[str]:
-    """Fall back to Corepack or the other interpreter name when argv[0] has no executable."""
+    """Fall back to Corepack or python3 when the requested executable is unavailable."""
     path = env.get("PATH")
     if shutil.which(argv[0], path=path):
         return argv

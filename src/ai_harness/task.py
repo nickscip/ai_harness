@@ -17,6 +17,7 @@ from .github import (
     repository_name,
 )
 from .pr import create_local_review, execute_review, publish_local_review
+from .process import controller_env, run_command
 from .progress import ProgressCallback
 from .prompts import (
     task_command_repair_prompt,
@@ -44,6 +45,22 @@ from .slack import (
 from .state import RunStore, new_run_id, sha256_bytes
 
 WORKTREE_SETUP_TARGET = "worktree-setup"
+_MAKEFILE_NAMES = ("GNUmakefile", "makefile", "Makefile")
+_MAKE_DATABASE_PROBE_TARGET = "__ai_harness_make_probe__"
+
+
+def _make_database_declares_target(database: str, target: str) -> bool:
+    _, marker, files = database.partition("# Files")
+    if not marker:
+        raise HarnessError("Could not inspect worktree setup target: malformed make database")
+    declaration = f"{target}:"
+    for record in files.split("\n\n"):
+        lines = record.splitlines()
+        if "# Not a target:" not in lines and any(
+            line.startswith(declaration) for line in lines
+        ):
+            return True
+    return False
 
 
 def worktree_setup_command(worktree: Path, source_repo: Path) -> list[str] | None:
@@ -52,12 +69,26 @@ def worktree_setup_command(worktree: Path, source_repo: Path) -> list[str] | Non
     A fresh worktree has no ignored build inputs — no virtualenv, no node_modules, no
     `.env` — so verification commands fail until the project installs them itself.
     """
-    makefile = worktree / "Makefile"
-    if not makefile.is_file():
+    candidates = (worktree / name for name in _MAKEFILE_NAMES)
+    makefile = next((path for path in candidates if path.is_file()), None)
+    if makefile is None:
         return None
-    declaration = f"{WORKTREE_SETUP_TARGET}:"
-    text = makefile.read_text(encoding="utf-8", errors="ignore")
-    if not any(line.startswith(declaration) for line in text.splitlines()):
+    probe_env = controller_env()
+    probe_env.pop("MAKEFILES", None)
+    probe_env["LC_ALL"] = "C"
+    database = run_command(
+        ["make", "-qp", "-f", "-", "-f", str(makefile), _MAKE_DATABASE_PROBE_TARGET],
+        cwd=worktree,
+        env=probe_env,
+        input_text=f"{_MAKE_DATABASE_PROBE_TARGET}:\n",
+        check=False,
+    )
+    if database.returncode not in {0, 1}:
+        detail = database.stderr.strip() or database.stdout.strip()
+        raise HarnessError(
+            f"Could not inspect worktree setup target ({database.returncode}):\n{detail[-2000:]}"
+        )
+    if not _make_database_declares_target(database.stdout, WORKTREE_SETUP_TARGET):
         return None
     return ["make", WORKTREE_SETUP_TARGET, f"ENV_SOURCE={source_repo / '.env'}"]
 
@@ -73,9 +104,15 @@ def _bootstrap_worktree(
     bootstrap = store.read_completed_stage("worktree-bootstrap")
     if bootstrap is not None:
         return bootstrap
-    argv = worktree_setup_command(worktree, source_repo)
     store.begin_stage("worktree-bootstrap", "controller")
     try:
+        argv = worktree_setup_command(worktree, source_repo)
+        changed = repo.status(cwd=worktree)
+        if changed:
+            raise HarnessError(
+                "Worktree setup inspection changed the worktree: "
+                + ", ".join(item.path for item in changed)
+            )
         if argv is None:
             bootstrap = {"ran": False, "commands": []}
         else:

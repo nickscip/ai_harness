@@ -94,14 +94,14 @@ def test_missing_python_falls_back_to_python3(monkeypatch: pytest.MonkeyPatch) -
     ) == ["python3", "-m", "unittest", "discover"]
 
 
-def test_missing_python3_falls_back_to_python(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_python3_does_not_fall_back_to_python(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_which(command: str, *, path: str | None = None) -> str | None:
         return "/controller/bin/python" if command == "python" else None
 
     monkeypatch.setattr("ai_harness.commands.shutil.which", fake_which)
 
     assert resolve_controller_argv(["python3", "-m", "pytest"], {"PATH": "/controller/bin"}) == [
-        "python",
+        "python3",
         "-m",
         "pytest",
     ]

@@ -529,6 +529,137 @@ def test_worktree_setup_command_is_opt_in_per_project(tmp_path: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("makefile_name", ["GNUmakefile", "makefile"])
+def test_worktree_setup_command_uses_standard_makefile_names(
+    tmp_path: Path, makefile_name: str
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    source = tmp_path / "source"
+    (worktree / makefile_name).write_text("worktree-setup:\n\t@true\n", encoding="utf-8")
+
+    assert worktree_setup_command(worktree, source) == [
+        "make",
+        "worktree-setup",
+        f"ENV_SOURCE={source / '.env'}",
+    ]
+
+
+def test_worktree_setup_command_uses_make_parsing_for_included_multi_target_rule(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    source = tmp_path / "source"
+    (worktree / "Makefile").write_text("include setup.mk\n", encoding="utf-8")
+    (worktree / "setup.mk").write_text(
+        "  prepare worktree-setup: install\n\t@true\n\ninstall:\n\t@true\n",
+        encoding="utf-8",
+    )
+
+    assert worktree_setup_command(worktree, source) == [
+        "make",
+        "worktree-setup",
+        f"ENV_SOURCE={source / '.env'}",
+    ]
+
+
+def test_worktree_setup_command_does_not_build_the_project_default_goal(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    source = tmp_path / "source"
+    (worktree / "Makefile").write_text(
+        ".DEFAULT_GOAL := broken\n\nbroken: missing-input\n\nworktree-setup:\n\t@true\n",
+        encoding="utf-8",
+    )
+
+    assert worktree_setup_command(worktree, source) == [
+        "make",
+        "worktree-setup",
+        f"ENV_SOURCE={source / '.env'}",
+    ]
+
+
+def test_worktree_setup_command_ignores_prerequisite_without_a_rule(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "Makefile").write_text("all: worktree-setup\n", encoding="utf-8")
+
+    assert worktree_setup_command(worktree, tmp_path / "source") is None
+
+
+def test_worktree_setup_command_ignores_ambient_makefiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "Makefile").write_text("install:\n\t@true\n", encoding="utf-8")
+    ambient = tmp_path / "ambient.mk"
+    ambient.write_text("worktree-setup:\n\t@true\n", encoding="utf-8")
+    monkeypatch.setenv("MAKEFILES", str(ambient))
+
+    assert worktree_setup_command(worktree, tmp_path / "source") is None
+
+
+def test_worktree_setup_command_sanitizes_probe_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "Makefile").write_text(
+        'PROBE := $(shell if test -n "$$GH_TOKEN"; then touch leaked-token; fi)\n\n'
+        "install:\n\t@true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GH_TOKEN", "not-a-real-token")
+
+    assert worktree_setup_command(worktree, tmp_path / "source") is None
+    assert not (worktree / "leaked-token").exists()
+
+
+def test_worktree_setup_command_uses_stable_make_database_locale(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "Makefile").write_text(
+        'PROBE := $(shell printf "%s" "$$LC_ALL" > probe-locale)\n\ninstall:\n\t@true\n',
+        encoding="utf-8",
+    )
+
+    assert worktree_setup_command(worktree, tmp_path / "source") is None
+    assert (worktree / "probe-locale").read_text(encoding="utf-8") == "C"
+
+
+def test_worktree_setup_command_fails_when_makefile_cannot_be_loaded(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "Makefile").write_text("include missing.mk\n", encoding="utf-8")
+
+    with pytest.raises(HarnessError, match="Could not inspect worktree setup target"):
+        worktree_setup_command(worktree, tmp_path / "source")
+
+
+@pytest.mark.parametrize("declares_setup", [False, True])
+def test_worktree_setup_inspection_rejects_tracked_changes_before_run_or_skip(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, declares_setup: bool
+) -> None:
+    setup_rule = "\nworktree-setup:\n\t@true\n" if declares_setup else ""
+    (git_repo.root / "Makefile").write_text(
+        "PROBE := $(shell echo changed > tracked.txt)\n\ninstall:\n\t@true\n" + setup_rule,
+        encoding="utf-8",
+    )
+    run_command(["git", "add", "Makefile"], cwd=git_repo.root)
+    run_command(["git", "commit", "-m", "add make probe"], cwd=git_repo.root)
+    monkeypatch.setattr("ai_harness.task.ProviderRunner", _PlanOnlyRunner)
+
+    with pytest.raises(HarnessError, match="Worktree setup inspection changed the worktree"):
+        start_task(
+            git_repo,
+            config=HarnessConfig(),
+            prompt="Add result.txt",
+            references=[],
+        )
+
+
 def test_worktree_setup_runs_before_planning_and_installs_ignored_inputs(
     git_repo: GitRepo, monkeypatch
 ) -> None:
