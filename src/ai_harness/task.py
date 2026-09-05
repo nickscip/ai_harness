@@ -40,7 +40,6 @@ from .slack import (
     classify_reply,
     parse_ts,
     reject_reason,
-    truncate_reply,
 )
 from .state import RunStore, new_run_id, sha256_bytes
 
@@ -173,6 +172,48 @@ def _slack_binding(state: dict[str, Any], stage: str, round_number: int, questio
     }
 
 
+def _bound_slack_progress(
+    state: dict[str, Any],
+    *,
+    stage: str,
+    round_number: int,
+    questions: list,
+) -> dict[str, Any] | None:
+    progress = state.get("slack_progress")
+    if not isinstance(progress, dict):
+        return None
+    binding = _slack_binding(state, stage, round_number, questions)
+    if {key: progress.get(key) for key in binding} != binding:
+        return None
+    return progress
+
+
+def collected_slack_answers(
+    state: dict[str, Any], pending: dict[str, Any]
+) -> dict[str, str]:
+    """Return nonblank Slack answers only when progress matches the exact pending plan."""
+    questions = pending.get("questions")
+    stage = pending.get("stage")
+    round_number = pending.get("round")
+    if not isinstance(questions, list) or not isinstance(stage, str) or not isinstance(
+        round_number, int
+    ):
+        return {}
+    progress = _bound_slack_progress(
+        state,
+        stage=stage,
+        round_number=round_number,
+        questions=questions,
+    )
+    if progress is None or not isinstance(progress.get("answers"), dict):
+        return {}
+    return {
+        str(key): str(value)
+        for key, value in progress["answers"].items()
+        if str(value).strip()
+    }
+
+
 def _slack_answers(
     *,
     store: RunStore,
@@ -194,10 +235,16 @@ def _slack_answers(
     resumes at the unanswered question rather than re-asking or losing an answer.
     """
     state = store.load()
+    ignored = int(state.get("slack_ignored_messages", 0))
     binding = _slack_binding(state, stage, round_number, questions)
-    progress = state.get("slack_progress")
-    if not isinstance(progress, dict) or {k: progress.get(k) for k in binding} != binding:
-        if isinstance(progress, dict):
+    progress = _bound_slack_progress(
+        state,
+        stage=stage,
+        round_number=round_number,
+        questions=questions,
+    )
+    if progress is None:
+        if isinstance(state.get("slack_progress"), dict):
             store.log("Discarding Slack progress bound to a different planning question set")
         progress = {
             **binding,
@@ -209,14 +256,117 @@ def _slack_answers(
             "answers": {},
             "deadline_epoch": time.time() + config.slack_wait_seconds,
             "clarifications": 0,
+            "clarification_attempts": 0,
+            "pending_clarification": None,
+            "send_in_flight": False,
         }
+
+    if "clarification_attempts" not in progress:
+        # PR-head progress counted a clarification before sending it. Recover the number of
+        # confirmed deliveries from receipts newer than the active question, while keeping the old
+        # count as the attempt index so an existing stage artifact is never reused for new text.
+        legacy_attempts = max(0, int(progress.get("clarifications", 0)))
+        receipt_ts = str(progress.get("receipt_ts", ""))
+        outbound = [str(value) for value in progress.get("outbound_ts", [])]
+        confirmed = min(
+            legacy_attempts,
+            sum(parse_ts(value) > parse_ts(receipt_ts) for value in outbound),
+        )
+        latest_known = max((parse_ts(value) for value in outbound), default=parse_ts(receipt_ts))
+        cursor_advanced = parse_ts(str(progress.get("cursor_ts", ""))) > latest_known
+        progress["clarifications"] = confirmed
+        progress["clarification_attempts"] = legacy_attempts
+        progress["pending_clarification"] = None
+        if legacy_attempts > confirmed:
+            legacy_stage = (
+                f"clarify-r{round_number}-{progress.get('question_id', '')}-{legacy_attempts}"
+            )
+            if store.read_completed_stage(legacy_stage) is not None:
+                progress["pending_clarification"] = {
+                    "attempt": legacy_attempts,
+                    "text": "",
+                }
+        progress["send_in_flight"] = legacy_attempts > confirmed or cursor_advanced
+    else:
+        progress.setdefault("pending_clarification", None)
+        progress.setdefault("send_in_flight", False)
+    if progress["send_in_flight"]:
+        # The transport may have posted before its process returned malformed output or died. Its
+        # timestamp is unknowable, so never poll the old receipt again. A fresh question receipt
+        # advances the cursor past that possible self-message before any read occurs.
+        store.log("Recovering from an uncertain Slack send with a fresh question receipt")
+        progress["channel_id"] = ""
+        progress["receipt_ts"] = ""
+        progress["cursor_ts"] = ""
+        progress["send_in_flight"] = False
+
+    # A resume is a new wait invocation. Honor its configured --slack-wait window even when the
+    # previous invocation persisted an expired deadline with the same question receipt.
+    progress["deadline_epoch"] = time.time() + config.slack_wait_seconds
 
     def save() -> None:
         current = store.load()
         current["slack_progress"] = progress
+        current["slack_ignored_messages"] = ignored
         store.save(current)
 
+    def deliver_pending_clarification(
+        question: dict[str, Any], identifier: str, receipt: Receipt
+    ) -> None:
+        pending = progress.get("pending_clarification")
+        if not isinstance(pending, dict):
+            return
+        attempt = int(pending["attempt"])
+        clarify_stage = f"clarify-r{round_number}-{identifier}-{attempt}"
+        clarification = store.read_completed_stage(clarify_stage)
+        if clarification is None:
+            clarification_text = str(pending.get("text", ""))
+            if not clarification_text:
+                raise HarnessError(
+                    f"Pending Slack clarification has no completed artifact: {clarify_stage}"
+                )
+            clarification = runner.run(
+                ProviderRequest(
+                    family=primary,
+                    stage=clarify_stage,
+                    cwd=worktree,
+                    prompt=task_plan_clarify_prompt(
+                        str(store.load()["prompt"]),
+                        store.root / f"{stage}.json",
+                        {
+                            "id": identifier,
+                            "question": str(question["question"]),
+                            "why_blocking": str(question["why_blocking"]),
+                            "suggested_default": str(question.get("suggested_default", "")),
+                        },
+                        clarification_text,
+                        context,
+                    ),
+                    schema_name="clarification",
+                    writable=False,
+                    timeout=config.stage_timeout,
+                    context_dirs=(*context_dirs, store.root),
+                )
+            )
+        else:
+            validate_output("clarification", clarification)
+
+        progress["send_in_flight"] = True
+        save()
+        sent = channel.post_reply(receipt, str(clarification["answer"]))
+        progress["clarifications"] = int(progress["clarifications"]) + 1
+        progress["outbound_ts"] = [*progress["outbound_ts"], sent.message_ts]
+        if parse_ts(sent.message_ts) > parse_ts(str(progress["cursor_ts"])):
+            progress["cursor_ts"] = sent.message_ts
+        progress["pending_clarification"] = None
+        progress["send_in_flight"] = False
+        save()
+        channel.set_outbound(progress["outbound_ts"])
+
     save()
+    if ignored >= MAX_IGNORED_SLACK_MESSAGES:
+        store.log("Too many unusable Slack messages; falling back to manual input")
+        return None
 
     for index, question in enumerate(questions):
         identifier = str(question["id"])
@@ -225,15 +375,21 @@ def _slack_answers(
         position = f"question {index + 1} of {len(questions)}"
 
         if progress["question_id"] != identifier or not progress["receipt_ts"]:
+            if progress["question_id"] != identifier:
+                progress["question_id"] = identifier
+                progress["clarifications"] = 0
+                progress["clarification_attempts"] = 0
+                progress["pending_clarification"] = None
+            progress["send_in_flight"] = True
+            save()
             receipt = channel.post_question(
                 _question_message(question, run_id=store.run_id, position=position)
             )
-            progress["question_id"] = identifier
             progress["channel_id"] = receipt.channel_id
             progress["receipt_ts"] = receipt.message_ts
             progress["outbound_ts"] = [*progress["outbound_ts"], receipt.message_ts]
             progress["cursor_ts"] = receipt.message_ts
-            progress["clarifications"] = 0
+            progress["send_in_flight"] = False
             save()
             store.log(f"Asked {identifier} on Slack; waiting for a reply")
         else:
@@ -244,7 +400,7 @@ def _slack_answers(
             store.log(f"Resuming the Slack wait for {identifier}")
 
         channel.set_outbound(progress["outbound_ts"])
-        ignored = 0
+        deliver_pending_clarification(question, identifier, receipt)
         while True:
             remaining = float(progress["deadline_epoch"]) - time.time()
             if remaining <= 0:
@@ -264,14 +420,14 @@ def _slack_answers(
                 receipt=receipt,
                 cursor_ts=str(progress["cursor_ts"]),
                 outbound_ts=progress["outbound_ts"],
-                target_sender=config.slack_user,
+                target_sender=config.slack_user.strip(),
             )
             if reason is not None:
                 ignored += 1
                 store.log(f"Ignoring a Slack message: {reason}")
                 if parse_ts(message.message_ts) > parse_ts(str(progress["cursor_ts"])):
                     progress["cursor_ts"] = message.message_ts
-                    save()
+                save()
                 if ignored >= MAX_IGNORED_SLACK_MESSAGES:
                     store.log("Too many unusable Slack messages; falling back to manual input")
                     return None
@@ -279,15 +435,22 @@ def _slack_answers(
 
             progress["cursor_ts"] = message.message_ts
             save()
-            routed = classify_reply(truncate_reply(message.text))
+            routed = classify_reply(message.text)
+
+            if not routed.text.strip():
+                ignored += 1
+                store.log("Ignoring a Slack message: routed reply is empty")
+                save()
+                if ignored >= MAX_IGNORED_SLACK_MESSAGES:
+                    store.log("Too many unusable Slack messages; falling back to manual input")
+                    return None
+                continue
 
             if routed.routing is Routing.CANCEL:
                 store.log("Slack conversation cancelled; falling back to manual input")
                 return None
 
             if routed.routing is Routing.ANSWER:
-                if not routed.text.strip():
-                    continue
                 progress["answers"] = {**progress["answers"], identifier: routed.text}
                 progress["question_id"] = ""
                 progress["receipt_ts"] = ""
@@ -300,49 +463,23 @@ def _slack_answers(
                     "That's my clarification limit for this question. Reply with your decision, "
                     "or answer from the terminal with `ai-harness resume`."
                 )
+                progress["send_in_flight"] = True
+                save()
                 sent = channel.post_reply(receipt, notice)
                 progress["outbound_ts"] = [*progress["outbound_ts"], sent.message_ts]
+                progress["send_in_flight"] = False
                 save()
                 store.log("Slack clarification limit reached; falling back to manual input")
                 return None
 
-            progress["clarifications"] = int(progress["clarifications"]) + 1
+            clarification_attempt = int(progress["clarification_attempts"]) + 1
+            progress["clarification_attempts"] = clarification_attempt
+            progress["pending_clarification"] = {
+                "attempt": clarification_attempt,
+                "text": routed.text,
+            }
             save()
-            clarify_stage = f"clarify-r{round_number}-{identifier}-{progress['clarifications']}"
-            clarification = store.read_completed_stage(clarify_stage)
-            if clarification is None:
-                clarification = runner.run(
-                    ProviderRequest(
-                        family=primary,
-                        stage=clarify_stage,
-                        cwd=worktree,
-                        prompt=task_plan_clarify_prompt(
-                            str(store.load()["prompt"]),
-                            store.root / f"{stage}.json",
-                            {
-                                "id": identifier,
-                                "question": str(question["question"]),
-                                "why_blocking": str(question["why_blocking"]),
-                                "suggested_default": str(question.get("suggested_default", "")),
-                            },
-                            routed.text,
-                            context,
-                        ),
-                        schema_name="clarification",
-                        writable=False,
-                        timeout=config.stage_timeout,
-                        context_dirs=(*context_dirs, store.root),
-                    )
-                )
-            else:
-                validate_output("clarification", clarification)
-
-            sent = channel.post_reply(receipt, str(clarification["answer"]))
-            progress["outbound_ts"] = [*progress["outbound_ts"], sent.message_ts]
-            if parse_ts(sent.message_ts) > parse_ts(str(progress["cursor_ts"])):
-                progress["cursor_ts"] = sent.message_ts
-            save()
-            channel.set_outbound(progress["outbound_ts"])
+            deliver_pending_clarification(question, identifier, receipt)
 
     return {str(key): str(value) for key, value in progress["answers"].items()}
 
@@ -397,6 +534,10 @@ def _resolve_plan(
                     "Answers do not match pending questions "
                     f"(missing={missing}, extra={extra}, blank={blank})"
                 )
+            # Slack calls persist spend and conversation progress while this function waits.
+            # Merge the resolved answers into the latest state instead of overwriting those writes
+            # with the snapshot loaded before `_slack_answers` ran.
+            state = store.load()
             history = list(state.get("human_answers", []))
             history.append(
                 {

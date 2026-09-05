@@ -8,7 +8,7 @@ from ai_harness.cli import _parse_answers
 from ai_harness.config import HarnessConfig
 from ai_harness.errors import AwaitingInput
 from ai_harness.git import GitRepo
-from ai_harness.slack import ChannelError, InboundMessage, Receipt
+from ai_harness.slack import MAX_REPLY_CHARS, ChannelError, InboundMessage, Receipt
 from ai_harness.state import RunStore, list_runs
 from ai_harness.task import MAX_IGNORED_SLACK_MESSAGES, execute_task, start_task
 
@@ -180,6 +180,42 @@ def test_slack_answer_resumes_planning_without_a_manual_resume(git_repo, monkeyp
     assert Path(final["result"]["worktree"], "result.txt").is_file()
 
 
+def test_answer_application_preserves_spend_recorded_during_slack_wait(
+    git_repo, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    class SpendingChannel(FakeChannel):
+        def wait_for_reply(self, receipt, *, after_ts, deadline):
+            self.budget.charge(1.25)
+            return super().wait_for_reply(receipt, after_ts=after_ts, deadline=deadline)
+
+    channel = SpendingChannel(["Use JSON"])
+    monkeypatch.setattr(
+        "ai_harness.task.ProviderRunner", _runner_factory(calls, {"plan": [QUESTION]})
+    )
+
+    def build_channel(config, store, budget):
+        channel.budget = budget
+        return channel
+
+    monkeypatch.setattr("ai_harness.task.build_question_channel", build_channel)
+
+    store = _start(git_repo, _slack_config())
+
+    assert store.load()["slack_spent_usd"] == pytest.approx(1.25)
+
+
+def test_reply_provenance_uses_the_normalized_slack_target(git_repo, monkeypatch) -> None:
+    calls: list[str] = []
+    channel = FakeChannel(["Use JSON"])
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, channel)
+
+    store = _start(git_repo, _slack_config(slack_user="  U_HUMAN\t"))
+
+    assert store.load()["human_answers"][0]["answers"] == {"Q001": "Use JSON"}
+
+
 def test_question_reply_runs_a_clarify_stage_per_turn_without_reposting(
     git_repo, monkeypatch
 ) -> None:
@@ -201,6 +237,18 @@ def test_question_reply_runs_a_clarify_stage_per_turn_without_reposting(
     final = store.load()
     assert final["status"] == "completed"
     assert final["human_answers"][0]["answers"] == {"Q001": "Use JSON"}
+
+
+def test_long_reply_is_classified_before_its_payload_is_truncated(git_repo, monkeypatch) -> None:
+    calls: list[str] = []
+    long_question = "x" * (MAX_REPLY_CHARS + 100) + "?"
+    channel = FakeChannel([long_question, "Use JSON"])
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, channel)
+
+    store = _start(git_repo, _slack_config())
+
+    assert calls[:2] == ["plan", "clarify-r1-Q001-1"]
+    assert store.load()["human_answers"][0]["answers"] == {"Q001": "Use JSON"}
 
 
 def test_clarification_answers_are_excluded_from_the_next_poll(git_repo, monkeypatch) -> None:
@@ -241,6 +289,31 @@ def test_timeout_keeps_collected_answers_and_falls_back_to_manual_resume(
     assert store.load()["human_answers"][0]["answers"] == merged
 
 
+def test_bare_resume_with_partial_slack_answers_pauses_cleanly_when_slack_is_disabled(
+    git_repo, monkeypatch
+) -> None:
+    calls: list[str] = []
+    channel = FakeChannel(["Use JSON", None])
+    _install(monkeypatch, calls, {"plan": [QUESTION, SECOND_QUESTION]}, channel)
+
+    with pytest.raises(AwaitingInput):
+        _start(git_repo, _slack_config())
+
+    state = list_runs(git_repo.common_git_dir)[0]
+    answers = _parse_answers(state, [])
+    assert answers is None
+
+    monkeypatch.setattr("ai_harness.task.build_question_channel", lambda *args, **kwargs: None)
+    store = RunStore(git_repo.common_git_dir, state["id"])
+    with pytest.raises(AwaitingInput):
+        execute_task(
+            store,
+            git_repo,
+            _slack_config(slack_enabled=False),
+            answers=answers,
+        )
+
+
 def test_explicit_answer_overrides_what_slack_collected(git_repo, monkeypatch) -> None:
     calls: list[str] = []
     channel = FakeChannel(["Use JSON", None])
@@ -252,6 +325,22 @@ def test_explicit_answer_overrides_what_slack_collected(git_repo, monkeypatch) -
     state = list_runs(git_repo.common_git_dir)[0]
     merged = _parse_answers(state, ["Q001=Actually use text", "Q002=Keep it"])
     assert merged == {"Q001": "Actually use text", "Q002": "Keep it"}
+
+
+def test_manual_answer_merge_rejects_slack_progress_for_a_changed_plan_artifact(
+    git_repo, monkeypatch
+) -> None:
+    calls: list[str] = []
+    channel = FakeChannel(["Use JSON", None])
+    _install(monkeypatch, calls, {"plan": [QUESTION, SECOND_QUESTION]}, channel)
+
+    with pytest.raises(AwaitingInput):
+        _start(git_repo, _slack_config())
+
+    state = list_runs(git_repo.common_git_dir)[0]
+    state["stages"]["plan"]["sha256"] = "changed-artifact"
+
+    assert _parse_answers(state, ["Q002=Keep it"]) == {"Q002": "Keep it"}
 
 
 def test_resume_after_a_crash_continues_the_wait_instead_of_reposting(
@@ -274,6 +363,27 @@ def test_resume_after_a_crash_continues_the_wait_instead_of_reposting(
     _install(monkeypatch, calls, {"plan": [QUESTION]}, second)
     store = RunStore(git_repo.common_git_dir, state["id"])
     execute_task(store, git_repo, _slack_config())
+
+    assert second.questions_posted == []
+    assert store.load()["human_answers"][0]["answers"] == {"Q001": "Use JSON"}
+
+
+def test_resume_refreshes_an_expired_slack_wait_deadline(git_repo, monkeypatch) -> None:
+    calls: list[str] = []
+    first = FakeChannel([None])
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, first)
+
+    with pytest.raises(AwaitingInput):
+        _start(git_repo, _slack_config())
+
+    state = list_runs(git_repo.common_git_dir)[0]
+    state["slack_progress"]["deadline_epoch"] = 0
+    store = RunStore(git_repo.common_git_dir, state["id"])
+    store.save(state)
+
+    second = FakeChannel(["Use JSON"], start=500.0)
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, second)
+    execute_task(store, git_repo, _slack_config(slack_wait_seconds=30))
 
     assert second.questions_posted == []
     assert store.load()["human_answers"][0]["answers"] == {"Q001": "Use JSON"}
@@ -339,6 +449,163 @@ def test_channel_failure_degrades_to_the_manual_pause(git_repo, monkeypatch) -> 
     assert Path(result["worktree"], "result.txt").is_file()
 
 
+def test_failed_clarification_send_does_not_consume_a_clarification_turn(
+    git_repo, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    class FailingReplyChannel(FakeChannel):
+        def post_reply(self, receipt: Receipt, text: str) -> Receipt:
+            self.replies_posted.append(text)
+            raise ChannelError("reply response was invalid")
+
+    channel = FailingReplyChannel(["q: why JSON?"])
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, channel)
+
+    with pytest.raises(AwaitingInput):
+        _start(git_repo, _slack_config())
+
+    state = list_runs(git_repo.common_git_dir)[0]
+    assert state["slack_progress"]["clarifications"] == 0
+    assert calls == ["plan", "clarify-r1-Q001-1"]
+
+
+def test_uncertain_send_reposts_before_polling_so_our_message_cannot_be_an_answer(
+    git_repo, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    class AmbiguousReplyChannel(FakeChannel):
+        def post_reply(self, receipt: Receipt, text: str) -> Receipt:
+            self.replies_posted.append(text)
+            self.unknown_ts = self._ts()
+            raise ChannelError("reply was delivered but its response was invalid")
+
+    first = AmbiguousReplyChannel(["q: why JSON?"])
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, first)
+    with pytest.raises(AwaitingInput):
+        _start(git_repo, _slack_config())
+
+    state = list_runs(git_repo.common_git_dir)[0]
+
+    class RecoveryChannel(FakeChannel):
+        def __init__(self) -> None:
+            super().__init__(["Use JSON"], start=500.0)
+            self.returned_unknown_post = False
+
+        def wait_for_reply(self, receipt, *, after_ts, deadline):
+            if not self.returned_unknown_post:
+                self.returned_unknown_post = True
+                return InboundMessage(
+                    channel_id=self.channel_id,
+                    message_ts=first.unknown_ts,
+                    thread_ts=state["slack_progress"]["receipt_ts"],
+                    sender_id="U_HUMAN",
+                    text=first.replies_posted[0],
+                )
+            return super().wait_for_reply(receipt, after_ts=after_ts, deadline=deadline)
+
+    second = RecoveryChannel()
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, second)
+    store = RunStore(git_repo.common_git_dir, state["id"])
+    execute_task(store, git_repo, _slack_config())
+
+    assert len(second.questions_posted) == 1
+    assert store.load()["human_answers"][0]["answers"] == {"Q001": "Use JSON"}
+
+
+def test_failed_clarification_send_does_not_reuse_its_stage_for_a_new_follow_up(
+    git_repo, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    class FailingReplyChannel(FakeChannel):
+        def post_reply(self, receipt: Receipt, text: str) -> Receipt:
+            self.replies_posted.append(text)
+            raise ChannelError("reply response was invalid")
+
+    first = FailingReplyChannel(["q: why JSON?"])
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, first)
+    with pytest.raises(AwaitingInput):
+        _start(git_repo, _slack_config())
+
+    state = list_runs(git_repo.common_git_dir)[0]
+    second = FakeChannel(["q: what about CSV?", "Use JSON"], start=500.0)
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, second)
+    store = RunStore(git_repo.common_git_dir, state["id"])
+    execute_task(store, git_repo, _slack_config())
+
+    assert calls[:3] == ["plan", "clarify-r1-Q001-1", "clarify-r1-Q001-2"]
+    assert second.replies_posted == [
+        "Clarified for clarify-r1-Q001-1.",
+        "Clarified for clarify-r1-Q001-2.",
+    ]
+
+
+def test_completed_clarification_is_delivered_after_a_crash_before_send_intent(
+    git_repo, monkeypatch
+) -> None:
+    calls: list[str] = []
+    base_runner = _runner_factory(calls, {"plan": [QUESTION]})
+
+    class CrashingRunner(base_runner):
+        def run(self, request):
+            value = super().run(request)
+            if request.stage.startswith("clarify-"):
+                raise KeyboardInterrupt
+            return value
+
+    first = FakeChannel(["q: why JSON?"])
+    monkeypatch.setattr("ai_harness.task.ProviderRunner", CrashingRunner)
+    monkeypatch.setattr(
+        "ai_harness.task.build_question_channel",
+        lambda config, store, budget: first,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        _start(git_repo, _slack_config())
+
+    state = list_runs(git_repo.common_git_dir)[0]
+    second = FakeChannel(["Use JSON"], start=500.0)
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, second)
+    store = RunStore(git_repo.common_git_dir, state["id"])
+    execute_task(store, git_repo, _slack_config())
+
+    assert second.questions_posted == []
+    assert second.replies_posted == ["Clarified for clarify-r1-Q001-1."]
+
+
+def test_legacy_attempted_clarification_is_migrated_as_unconfirmed_delivery(
+    git_repo, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    class FailingReplyChannel(FakeChannel):
+        def post_reply(self, receipt: Receipt, text: str) -> Receipt:
+            self.replies_posted.append(text)
+            raise ChannelError("reply response was invalid")
+
+    first = FailingReplyChannel(["q: why JSON?"])
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, first)
+    with pytest.raises(AwaitingInput):
+        _start(git_repo, _slack_config())
+
+    state = list_runs(git_repo.common_git_dir)[0]
+    progress = state["slack_progress"]
+    progress["clarifications"] = 1
+    progress.pop("clarification_attempts")
+    progress.pop("send_in_flight")
+    store = RunStore(git_repo.common_git_dir, state["id"])
+    store.save(state)
+
+    second = FakeChannel(["Use JSON"], start=500.0)
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, second)
+    execute_task(store, git_repo, _slack_config())
+
+    assert len(second.questions_posted) == 1
+    assert second.replies_posted == ["Clarified for clarify-r1-Q001-1."]
+    assert store.load()["human_answers"][0]["answers"] == {"Q001": "Use JSON"}
+
+
 def test_unusable_messages_are_ignored_and_bounded(git_repo, monkeypatch) -> None:
     calls: list[str] = []
 
@@ -367,3 +634,68 @@ def test_unusable_messages_are_ignored_and_bounded(git_repo, monkeypatch) -> Non
     # The bound is what stops this, not an early bail: assert the loop actually ran to its cap.
     assert channel.waits == MAX_IGNORED_SLACK_MESSAGES
     assert calls == ["plan"]
+
+
+def test_empty_prefixed_answers_count_toward_the_ignored_message_limit(
+    git_repo, monkeypatch
+) -> None:
+    calls: list[str] = []
+
+    class EmptyAnswerChannel(FakeChannel):
+        def __init__(self) -> None:
+            super().__init__(["a:"] * MAX_IGNORED_SLACK_MESSAGES)
+            self.waits = 0
+
+        def wait_for_reply(self, receipt, *, after_ts, deadline):
+            self.waits += 1
+            return super().wait_for_reply(receipt, after_ts=after_ts, deadline=deadline)
+
+    channel = EmptyAnswerChannel()
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, channel)
+
+    with pytest.raises(AwaitingInput):
+        _start(git_repo, _slack_config())
+
+    state = list_runs(git_repo.common_git_dir)[0]
+    assert channel.waits == MAX_IGNORED_SLACK_MESSAGES
+    assert state["slack_ignored_messages"] == MAX_IGNORED_SLACK_MESSAGES
+
+
+def test_ignored_message_limit_is_persisted_across_resumes(git_repo, monkeypatch) -> None:
+    calls: list[str] = []
+
+    class RejectedThenChannel(FakeChannel):
+        def __init__(self, invalid: int, replies: list, *, start: float = 100.0) -> None:
+            super().__init__(replies, start=start)
+            self.invalid = invalid
+            self.waits = 0
+
+        def wait_for_reply(self, receipt, *, after_ts, deadline):
+            self.waits += 1
+            if self.invalid:
+                self.invalid -= 1
+                return InboundMessage(
+                    channel_id=self.channel_id,
+                    message_ts=receipt.message_ts,
+                    thread_ts="",
+                    sender_id="U_HUMAN",
+                    text="Use JSON",
+                )
+            return super().wait_for_reply(receipt, after_ts=after_ts, deadline=deadline)
+
+    first = RejectedThenChannel(MAX_IGNORED_SLACK_MESSAGES - 4, [None])
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, first)
+    with pytest.raises(AwaitingInput):
+        _start(git_repo, _slack_config())
+
+    state = list_runs(git_repo.common_git_dir)[0]
+    assert state["slack_ignored_messages"] == MAX_IGNORED_SLACK_MESSAGES - 4
+
+    second = RejectedThenChannel(4, ["Use JSON"], start=500.0)
+    _install(monkeypatch, calls, {"plan": [QUESTION]}, second)
+    store = RunStore(git_repo.common_git_dir, state["id"])
+    with pytest.raises(AwaitingInput):
+        execute_task(store, git_repo, _slack_config())
+
+    assert second.waits == 4
+    assert store.load()["slack_ignored_messages"] == MAX_IGNORED_SLACK_MESSAGES

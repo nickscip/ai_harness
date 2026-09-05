@@ -149,20 +149,22 @@ def parse_ts(value: str) -> float:
 
 
 def classify_reply(text: str) -> RoutedReply:
-    """Explicit prefixes win; bare text falls back to the documented `?` heuristic."""
+    """Classify the original text, then cap only the routed payload."""
     stripped = text.strip()
     lowered = stripped.lower()
     if lowered == "cancel":
-        return RoutedReply(Routing.CANCEL, stripped)
-    if lowered.startswith("a:"):
-        return RoutedReply(Routing.ANSWER, stripped[2:].strip())
-    if lowered.startswith("q:"):
-        return RoutedReply(Routing.QUESTION, stripped[2:].strip())
-    if stripped.startswith("?"):
-        return RoutedReply(Routing.QUESTION, stripped[1:].strip())
-    if stripped.endswith("?"):
-        return RoutedReply(Routing.QUESTION, stripped)
-    return RoutedReply(Routing.ANSWER, stripped)
+        routing, payload = Routing.CANCEL, stripped
+    elif lowered.startswith("a:"):
+        routing, payload = Routing.ANSWER, stripped[2:].strip()
+    elif lowered.startswith("q:"):
+        routing, payload = Routing.QUESTION, stripped[2:].strip()
+    elif stripped.startswith("?"):
+        routing, payload = Routing.QUESTION, stripped[1:].strip()
+    elif stripped.endswith("?"):
+        routing, payload = Routing.QUESTION, stripped
+    else:
+        routing, payload = Routing.ANSWER, stripped
+    return RoutedReply(routing, truncate_reply(payload))
 
 
 def reject_reason(

@@ -13,7 +13,7 @@ from .git import GitRepo
 from .pr import execute_review, start_review
 from .progress import TerminalProgress
 from .state import RunStore, controller_lock, list_runs
-from .task import execute_task, start_task
+from .task import collected_slack_answers, execute_task, start_task
 
 
 def _common_parser() -> argparse.ArgumentParser:
@@ -118,35 +118,15 @@ def _status(repo: GitRepo, run_id: str | None) -> int:
     return 0
 
 
-def _collected_slack_answers(
-    state: dict[str, object],
-    pending: dict[str, object],
-) -> dict[str, str]:
-    """Answers already gathered over Slack before the wait budget or the channel gave out.
-
-    They only count when the persisted progress is still bound to this exact pending question
-    set; a later round may reuse a question ID, and answer validation matches on ID alone.
-    """
-    progress = state.get("slack_progress")
-    if not isinstance(progress, dict):
-        return {}
-    if progress.get("round") != pending.get("round") or progress.get("stage") != pending.get(
-        "stage"
-    ):
-        return {}
-    collected = progress.get("answers")
-    if not isinstance(collected, dict):
-        return {}
-    return {str(key): str(value) for key, value in collected.items() if str(value).strip()}
-
-
 def _parse_answers(state: dict[str, object], values: list[str]) -> dict[str, str] | None:
     pending = state.get("pending_input")
-    carried = (
-        _collected_slack_answers(state, pending) if isinstance(pending, dict) else {}
-    )
+    # Collected Slack answers may be partial. With no explicit terminal answers, leave them in
+    # progress so Slack can resume when enabled or the run can pause cleanly when disabled.
     if not values:
-        return carried or None
+        return None
+    carried = (
+        collected_slack_answers(state, pending) if isinstance(pending, dict) else {}
+    )
     if not isinstance(pending, dict):
         raise HarnessError("This run has no pending planning questions")
     questions = pending.get("questions")
