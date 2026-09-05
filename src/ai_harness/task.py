@@ -43,6 +43,68 @@ from .slack import (
 )
 from .state import RunStore, new_run_id, sha256_bytes
 
+WORKTREE_SETUP_TARGET = "worktree-setup"
+
+
+def worktree_setup_command(worktree: Path, source_repo: Path) -> list[str] | None:
+    """A project opts into worktree bootstrap by declaring a `worktree-setup` make target.
+
+    A fresh worktree has no ignored build inputs — no virtualenv, no node_modules, no
+    `.env` — so verification commands fail until the project installs them itself.
+    """
+    makefile = worktree / "Makefile"
+    if not makefile.is_file():
+        return None
+    declaration = f"{WORKTREE_SETUP_TARGET}:"
+    text = makefile.read_text(encoding="utf-8", errors="ignore")
+    if not any(line.startswith(declaration) for line in text.splitlines()):
+        return None
+    return ["make", WORKTREE_SETUP_TARGET, f"ENV_SOURCE={source_repo / '.env'}"]
+
+
+def _bootstrap_worktree(
+    store: RunStore,
+    repo: GitRepo,
+    *,
+    worktree: Path,
+    source_repo: Path,
+    timeout: int,
+) -> dict[str, Any]:
+    bootstrap = store.read_completed_stage("worktree-bootstrap")
+    if bootstrap is not None:
+        return bootstrap
+    argv = worktree_setup_command(worktree, source_repo)
+    store.begin_stage("worktree-bootstrap", "controller")
+    try:
+        if argv is None:
+            bootstrap = {"ran": False, "commands": []}
+        else:
+            command_results = execute_planned_commands(
+                [
+                    {
+                        "argv": argv,
+                        "cwd": ".",
+                        "purpose": "Install the ignored build inputs this worktree needs.",
+                        "timeout_seconds": timeout,
+                    }
+                ],
+                worktree=worktree,
+                preparation=True,
+                progress=store.progress,
+            )
+            changed = repo.status(cwd=worktree)
+            if changed:
+                raise HarnessError(
+                    "Worktree setup changed the worktree: "
+                    + ", ".join(item.path for item in changed)
+                )
+            bootstrap = {"ran": True, "commands": command_results}
+        store.complete_stage("worktree-bootstrap", bootstrap)
+        return bootstrap
+    except Exception as exc:
+        store.fail_stage("worktree-bootstrap", str(exc))
+        raise
+
 
 def start_task(
     repo: GitRepo,
@@ -847,6 +909,14 @@ def execute_task(
     context_dir = store.root / "context"
     context_dirs = (context_dir,) if context_dir.is_dir() else ()
     git_admin = repo.git_admin_dir(worktree)
+
+    _bootstrap_worktree(
+        store,
+        repo,
+        worktree=worktree,
+        source_repo=Path(str(state["source_repo"])),
+        timeout=config.stage_timeout,
+    )
 
     def record_spend(total: float) -> None:
         current = store.load()

@@ -24,6 +24,7 @@ class TerminalProgress:
 
 
 _STAGE_LABELS = {
+    "worktree-bootstrap": "worktree setup",
     "plan": "repository-grounded plan",
     "plan-review": "adversarial plan review",
     "revised-plan": "review-driven plan revision",
@@ -91,6 +92,8 @@ def _stage_summary(name: str, value: dict[str, Any]) -> str:
         commands = value.get("commands")
         if isinstance(commands, list):
             return f"{len(commands)} command(s) passed"
+    if name == "worktree-bootstrap":
+        return "worktree-setup complete" if value.get("ran") else "no worktree-setup target"
     if name == "delivery-commit" and isinstance(value.get("sha"), str):
         return f"commit {value['sha'][:12]}"
     if name == "delivery-push" and isinstance(value.get("branch"), str):

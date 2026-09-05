@@ -7,8 +7,9 @@ import pytest
 from ai_harness.config import HarnessConfig
 from ai_harness.errors import AwaitingInput, HarnessError
 from ai_harness.git import GitRepo
+from ai_harness.process import run_command
 from ai_harness.state import RunStore, list_runs
-from ai_harness.task import execute_task, start_task
+from ai_harness.task import execute_task, start_task, worktree_setup_command
 
 
 def _plan() -> dict[str, object]:
@@ -463,3 +464,120 @@ def test_delivery_commits_reviews_pushes_opens_draft_pr_and_publishes(
         lambda *args: (_ for _ in ()).throw(AssertionError("must not push twice")),
     )
     execute_task(store, git_repo, HarnessConfig())
+
+
+class _PlanOnlyRunner:
+    """Drive the pipeline without providers so bootstrap behaviour is what fails or passes."""
+
+    def __init__(self, config, store: RunStore):
+        self.store = store
+
+    def run(self, request):
+        self.store.begin_stage(request.stage, request.family)
+        if request.stage == "plan":
+            value = _plan()
+        elif request.stage == "plan-review":
+            value = {
+                "verdict": "approve",
+                "summary": "No defects.",
+                "findings": [],
+                "required_changes": [],
+            }
+        elif request.stage == "revised-plan":
+            value = _revised_plan()
+        else:
+            (request.cwd / "result.txt").write_text("implemented\n", encoding="utf-8")
+            value = {
+                "summary": "Implemented.",
+                "changed_files": ["result.txt"],
+                "verification_requested": [],
+                "notes": [],
+            }
+        self.store.complete_stage(request.stage, value)
+        return value
+
+
+def _commit_makefile(git_repo: GitRepo, recipe: str, *, gitignore: str = "") -> None:
+    (git_repo.root / "Makefile").write_text(
+        f"ENV_SOURCE ?= ../../ai/.env\n\nworktree-setup:\n\t{recipe}\n", encoding="utf-8"
+    )
+    paths = ["Makefile"]
+    if gitignore:
+        (git_repo.root / ".gitignore").write_text(gitignore, encoding="utf-8")
+        paths.append(".gitignore")
+    run_command(["git", "add", *paths], cwd=git_repo.root)
+    run_command(["git", "commit", "-m", "add makefile"], cwd=git_repo.root)
+
+
+def test_worktree_setup_command_is_opt_in_per_project(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    source = tmp_path / "source"
+
+    assert worktree_setup_command(worktree, source) is None
+
+    (worktree / "Makefile").write_text("install:\n\techo hi\n", encoding="utf-8")
+    assert worktree_setup_command(worktree, source) is None
+
+    (worktree / "Makefile").write_text(
+        "worktree-setup: worktree-copy-env install\n", encoding="utf-8"
+    )
+    assert worktree_setup_command(worktree, source) == [
+        "make",
+        "worktree-setup",
+        f"ENV_SOURCE={source / '.env'}",
+    ]
+
+
+def test_worktree_setup_runs_before_planning_and_installs_ignored_inputs(
+    git_repo: GitRepo, monkeypatch
+) -> None:
+    (git_repo.root / ".env").write_text("SECRET=from-source\n", encoding="utf-8")
+    _commit_makefile(git_repo, 'cp "$(ENV_SOURCE)" .', gitignore=".env\n")
+    monkeypatch.setattr("ai_harness.task.ProviderRunner", _PlanOnlyRunner)
+
+    store = start_task(
+        git_repo,
+        config=HarnessConfig(),
+        prompt="Add result.txt",
+        references=[],
+    )
+
+    state = store.load()
+    worktree = Path(state["result"]["worktree"])
+    bootstrap = store.read_completed_stage("worktree-bootstrap")
+    assert bootstrap is not None and bootstrap["ran"] is True
+    assert (worktree / ".env").read_text(encoding="utf-8") == "SECRET=from-source\n"
+    assert [item.path for item in git_repo.status(cwd=worktree)] == ["result.txt"]
+    assert state["status"] == "completed"
+
+
+def test_worktree_setup_that_dirties_tracked_files_fails_the_run(
+    git_repo: GitRepo, monkeypatch
+) -> None:
+    _commit_makefile(git_repo, "echo setup-touched-a-tracked-file > tracked.txt")
+    monkeypatch.setattr("ai_harness.task.ProviderRunner", _PlanOnlyRunner)
+
+    with pytest.raises(HarnessError, match="Worktree setup changed the worktree: tracked.txt"):
+        start_task(
+            git_repo,
+            config=HarnessConfig(),
+            prompt="Add result.txt",
+            references=[],
+        )
+
+
+def test_missing_makefile_records_a_skipped_bootstrap_stage(
+    git_repo: GitRepo, monkeypatch
+) -> None:
+    monkeypatch.setattr("ai_harness.task.ProviderRunner", _PlanOnlyRunner)
+
+    store = start_task(
+        git_repo,
+        config=HarnessConfig(),
+        prompt="Add result.txt",
+        references=[],
+    )
+
+    bootstrap = store.read_completed_stage("worktree-bootstrap")
+    assert bootstrap == {"ran": False, "commands": []}
