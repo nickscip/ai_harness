@@ -35,6 +35,35 @@ def shallow_doctor() -> dict[str, Any]:
     return tools
 
 
+def slack_doctor(config: HarnessConfig) -> dict[str, Any]:
+    """Check the Slack question channel without spending model allowance.
+
+    Sending and reading direct messages are separate Slack permissions, so a connected server is
+    necessary but not sufficient; the first real run is what proves the read scope.
+    """
+    report: dict[str, Any] = {"enabled": config.slack_enabled, "problems": []}
+    if not config.slack_enabled:
+        report["status"] = "disabled"
+        return report
+    if not config.slack_user.strip():
+        report["problems"].append("AI_HARNESS_SLACK_USER is not set to a Slack user id")
+    result = run_command(
+        [str(find_claude()), "mcp", "list"], cwd=Path.cwd(), timeout=120, check=False
+    )
+    connected = [
+        line
+        for line in f"{result.stdout}\n{result.stderr}".splitlines()
+        if "slack" in line.lower() and "connected" in line.lower()
+    ]
+    report["connector"] = connected[0].strip() if connected else ""
+    if not connected:
+        report["problems"].append(
+            "No connected Slack MCP server. Authenticate it with `claude mcp` first."
+        )
+    report["status"] = "ready" if not report["problems"] else "unavailable"
+    return report
+
+
 def deep_doctor(config: HarnessConfig) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="ai-harness-doctor-") as temporary:
         repo = Path(temporary) / "repo"
@@ -81,11 +110,21 @@ def deep_doctor(config: HarnessConfig) -> dict[str, Any]:
         return results
 
 
-def format_doctor(tools: dict[str, Any], deep: dict[str, Any] | None) -> str:
+def format_doctor(
+    tools: dict[str, Any],
+    deep: dict[str, Any] | None,
+    slack: dict[str, Any] | None = None,
+) -> str:
     lines = ["ai-harness doctor: PASS"]
     for name, value in tools.items():
         lines.append(f"- {name}: {value['version']} ({value.get('path', 'runtime')})")
     if deep is not None:
         lines.append("- real structured-output round trips: claude PASS, codex PASS")
+    if slack is not None:
+        lines.append(f"- Slack question channel: {slack['status']}")
+        if slack.get("connector"):
+            lines.append(f"  {slack['connector']}")
+        for problem in slack.get("problems", []):
+            lines.append(f"  problem: {problem}")
     return "\n".join(lines)
 

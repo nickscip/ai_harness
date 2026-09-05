@@ -7,13 +7,13 @@ from pathlib import Path
 
 from .config import Family, HarnessConfig, other_family
 from .context import split_prompt_and_references
-from .doctor import deep_doctor, format_doctor, shallow_doctor
+from .doctor import deep_doctor, format_doctor, shallow_doctor, slack_doctor
 from .errors import AwaitingInput, HarnessError
 from .git import GitRepo
 from .pr import execute_review, start_review
 from .progress import TerminalProgress
 from .state import RunStore, controller_lock, list_runs
-from .task import execute_task, start_task
+from .task import collected_slack_answers, execute_task, start_task
 
 
 def _common_parser() -> argparse.ArgumentParser:
@@ -32,6 +32,17 @@ def _common_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Stop after verified implementation without committing, pushing, or opening a PR",
     )
+    parser.add_argument(
+        "--slack",
+        action="store_true",
+        help="Ask blocking planning questions over Slack instead of pausing the run",
+    )
+    parser.add_argument(
+        "--slack-wait",
+        type=int,
+        default=None,
+        help="Total seconds to wait for Slack answers before falling back to a manual pause",
+    )
     parser.add_argument("parts", nargs="*")
     return parser
 
@@ -43,10 +54,17 @@ def _config_from_args(args: argparse.Namespace) -> HarnessConfig:
         claude_model=args.claude_model,
         codex_model=args.codex_model,
         profile=getattr(args, "profile", None),
+        slack=True if getattr(args, "slack", False) else None,
+        slack_wait=getattr(args, "slack_wait", None),
     )
 
 
-def _config_from_state(state: dict[str, object]) -> HarnessConfig:
+def _config_from_state(
+    state: dict[str, object],
+    *,
+    slack: bool | None = None,
+    slack_wait: int | None = None,
+) -> HarnessConfig:
     options = state.get("options", {})
     assert isinstance(options, dict)
     family = state["primary_family"]
@@ -63,6 +81,14 @@ def _config_from_state(state: dict[str, object]) -> HarnessConfig:
         codex_reasoning=str(options.get("codex_reasoning", "medium")),
         stage_timeout=int(options.get("timeout", 900)),
         claude_max_budget_usd=float(options.get("claude_max_budget_usd", 8.0)),
+        slack_enabled=bool(options.get("slack_enabled", False)) if slack is None else slack,
+        slack_user=str(options.get("slack_user", "")),
+        slack_wait_seconds=(
+            int(options.get("slack_wait_seconds", 1800)) if slack_wait is None else slack_wait
+        ),
+        slack_budget_usd=float(options.get("slack_budget_usd", 5.0)),
+        slack_max_clarifications=int(options.get("slack_max_clarifications", 3)),
+        slack_poll_seconds=int(options.get("slack_poll_seconds", 20)),
     )
 
 
@@ -93,26 +119,37 @@ def _status(repo: GitRepo, run_id: str | None) -> int:
 
 
 def _parse_answers(state: dict[str, object], values: list[str]) -> dict[str, str] | None:
+    pending = state.get("pending_input")
+    # Collected Slack answers may be partial. With no explicit terminal answers, leave them in
+    # progress so Slack can resume when enabled or the run can pause cleanly when disabled.
     if not values:
         return None
-    pending = state.get("pending_input")
+    carried = (
+        collected_slack_answers(state, pending) if isinstance(pending, dict) else {}
+    )
     if not isinstance(pending, dict):
         raise HarnessError("This run has no pending planning questions")
     questions = pending.get("questions")
     if not isinstance(questions, list):
         raise HarnessError("Pending planning questions are corrupt")
     identifiers = [str(item["id"]) for item in questions]
-    answers: dict[str, str] = {}
+    # The shorthand form targets what is still outstanding, so it keeps working after Slack
+    # already collected some of the answers.
+    outstanding = [item for item in identifiers if item not in carried]
+    answers: dict[str, str] = dict(carried)
+    explicit: set[str] = set()
     for value in values:
         if "=" in value:
             identifier, answer = value.split("=", 1)
             identifier = identifier.strip()
-        elif len(identifiers) == 1 and len(values) == 1:
-            identifier, answer = identifiers[0], value
+        elif len(outstanding) == 1 and len(values) == 1:
+            identifier, answer = outstanding[0], value
         else:
             raise HarnessError("Use --answer 'Q001=your answer' for each pending question")
-        if identifier in answers:
+        if identifier in explicit:
             raise HarnessError(f"Duplicate answer for {identifier}")
+        explicit.add(identifier)
+        # An explicit --answer overrides whatever Slack collected for the same question.
         answers[identifier] = answer.strip()
     return answers
 
@@ -123,6 +160,8 @@ def _resume(
     answer_values: list[str],
     progress: TerminalProgress,
     timeout: int | None = None,
+    slack: bool | None = None,
+    slack_wait: int | None = None,
 ) -> int:
     store = RunStore(repo.common_git_dir, run_id, progress=progress)
     state = store.load()
@@ -137,7 +176,7 @@ def _resume(
         state["options"]["timeout"] = timeout
         store.save(state)
     source_repo = _repo_for_state(repo, state)
-    config = _config_from_state(state)
+    config = _config_from_state(state, slack=slack, slack_wait=slack_wait)
     progress(f"Resuming {state['kind']} run {run_id} ({state['status']})")
     progress(_model_profile_message(config))
     answers = _parse_answers(state, answer_values)
@@ -238,11 +277,14 @@ def _dispatch(argv: list[str]) -> int:
         parser.add_argument("--deep", action="store_true")
         parser.add_argument("--profile", default=None)
         parser.add_argument("--timeout", type=int, default=None)
+        parser.add_argument("--slack", action="store_true", default=None)
         args = parser.parse_args(argv[1:])
-        config = HarnessConfig.from_env(timeout=args.timeout, profile=args.profile)
+        config = HarnessConfig.from_env(
+            timeout=args.timeout, profile=args.profile, slack=args.slack
+        )
         tools = shallow_doctor()
         deep = deep_doctor(config) if args.deep else None
-        print(format_doctor(tools, deep))
+        print(format_doctor(tools, deep, slack_doctor(config)))
         return 0
 
     if argv and argv[0] in {"status", "resume", "cleanup"}:
@@ -262,6 +304,27 @@ def _dispatch(argv: list[str]) -> int:
                 default=None,
                 help="Override and persist the per-stage wall-clock timeout in seconds",
             )
+            slack_group = parser.add_mutually_exclusive_group()
+            slack_group.add_argument(
+                "--slack",
+                dest="slack",
+                action="store_true",
+                default=None,
+                help="Ask outstanding planning questions over Slack",
+            )
+            slack_group.add_argument(
+                "--no-slack",
+                dest="slack",
+                action="store_false",
+                default=None,
+                help="Answer from the terminal even if the run enabled Slack",
+            )
+            parser.add_argument(
+                "--slack-wait",
+                type=int,
+                default=None,
+                help="Total seconds to wait for Slack answers on this resume",
+            )
         args = parser.parse_args(argv[1:])
         repo = GitRepo.discover(Path.cwd())
         if command == "status":
@@ -273,6 +336,8 @@ def _dispatch(argv: list[str]) -> int:
                 args.answer,
                 TerminalProgress(),
                 timeout=args.timeout,
+                slack=args.slack,
+                slack_wait=args.slack_wait,
             )
         return _cleanup(repo, args.run_id)
 
@@ -288,6 +353,11 @@ def _dispatch(argv: list[str]) -> int:
         if args.parts[0] == "/review":
             if args.local_only:
                 raise HarnessError("--local-only is only valid with an implementation task")
+            if args.slack or args.slack_wait is not None:
+                raise HarnessError(
+                    "--slack is only valid with an implementation task; "
+                    "pull request reviews do not ask blocking questions"
+                )
             if len(args.parts) < 2:
                 parser.error("/review requires a pull request number")
             try:

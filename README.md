@@ -16,6 +16,7 @@ For implementation tasks it:
 
 That entire path is one workflow started by one command. A genuinely blocking planning question is
 the only intentional human pause; answering it resumes the same run at the exact stopped stage.
+With `--slack` that pause becomes a direct-message conversation the run continues from on its own.
 
 For pull requests it creates a detached worktree at the exact PR head, reviews the exact three-dot
 diff, has the other family critique the draft, and asks the primary family for the final review. By
@@ -85,6 +86,12 @@ the selected profile, then built-in library defaults. The common settings are:
 | Codex model | `--codex-model` | `AI_HARNESS_CODEX_MODEL` | `gpt-5.6-terra` |
 | Codex reasoning | — | `AI_HARNESS_CODEX_REASONING` | `medium` |
 | Per-agent timeout | `--timeout` | `AI_HARNESS_TIMEOUT` | selected profile |
+| Ask planning questions on Slack | `--slack` | `AI_HARNESS_SLACK` | off |
+| Slack user to ask | — | `AI_HARNESS_SLACK_USER` | none |
+| Total Slack wait per question set | `--slack-wait` | `AI_HARNESS_SLACK_WAIT` | `1800` |
+| Run-wide Slack spend cap | — | `AI_HARNESS_SLACK_BUDGET_USD` | `5.00` |
+| Clarification turns per question | — | `AI_HARNESS_SLACK_MAX_CLARIFICATIONS` | `3` |
+| Minimum Slack poll interval | — | `AI_HARNESS_SLACK_POLL_SECONDS` | `20` |
 
 For example, select Codex as the primary planner/implementer and preview the resolution:
 
@@ -194,6 +201,67 @@ For a single pending question, `--answer 'your answer'` is accepted as shorthand
 receives the answers in a fresh structured call, rewrites the plan, and may pause again only for a new
 blocking ambiguity. Answer history is stored with the run artifacts.
 
+## Answering planning questions on Slack
+
+`--slack` turns that pause into a direct-message conversation instead of a stopped run. The
+controller asks one question at a time, waits for your reply, and feeds it into the same answer
+machinery the manual path uses, so the run continues without a second `ai-harness resume`:
+
+```sh
+export AI_HARNESS_SLACK_USER=U0123456789
+ai-harness --slack "Add bounded retries to the upload worker and test the exhausted path"
+```
+
+Replies are routed by an explicit prefix, and the message itself states the convention:
+
+| Reply | Meaning |
+|---|---|
+| `q: why not JSON` or `?why not JSON` | ask the planner first; its answer is sent back and the same question keeps waiting |
+| `a: use JSON, okay?` | force the reply to count as the answer |
+| `cancel` | stop using Slack and pause for `ai-harness resume` instead |
+| anything else | ends with `?` is treated as a question, otherwise as the answer |
+
+The bare heuristic misreads both `Use JSON, okay?` and `why not JSON`, which is why the prefixes
+exist. Clarification turns are capped per question.
+
+Slack is an accelerator, never a requirement. A wait that runs out, a revoked connector, a missing
+scope, a rate limit, a malformed reply, or an exhausted allowance all fall back to the normal
+`awaiting_input` pause. Answers already collected are kept, so only the outstanding questions need
+`--answer`, and `--no-slack` forces the terminal path on a resume:
+
+```sh
+ai-harness resume <run-id> --answer 'Q002=Keep backward compatibility'
+ai-harness resume <run-id> --no-slack
+```
+
+Check the channel before relying on it. Sending and reading direct messages are separate Slack
+permissions, so a connected server is necessary but not sufficient — the first real run proves the
+read path:
+
+```sh
+ai-harness doctor --slack
+```
+
+Cost is worth knowing up front. There is no Slack token: the controller reaches Slack through the
+Claude CLI's authenticated connector, and enabling connectors loads every configured MCP server's
+tool schemas into the prompt, which is the bulk of the price. Measured: about $0.64 for a single
+send or read, and about $0.96 for a wait that polled six times, so cost rises with the number of
+polls rather than staying flat.
+
+A wait therefore stretches its poll interval rather than adding round trips, capping any one call
+at twenty polls. A full 30-minute wait polls every 90 seconds and costs roughly $1.90 in total
+instead of the $6 it would cost as ninety polls. Budget about $2.50 for a question answered on the
+first reply, plus roughly $1.50 per clarification turn. `AI_HARNESS_SLACK_BUDGET_USD` is a run-wide
+cap the controller enforces across processes, since `--max-budget-usd` only bounds one of them; a
+call that would exceed the run cap is never launched and the run falls back to the manual pause.
+
+Raising `AI_HARNESS_SLACK_POLL_SECONDS` lowers cost and slows how quickly a reply is noticed.
+
+Two other things to know. The controller lock is held for the whole wait, so `resume`, `cleanup`,
+and new runs in the same repository block until you answer or the wait budget expires; `status` is
+unaffected. And the feature applies to task planning only — pull request reviews do not ask
+blocking questions, and `--slack` is rejected with `/review`.
+
 Task worktrees intentionally remain after success. Delivered worktrees are clean because their
 changes have been committed and pushed; `--local-only` worktrees remain dirty by design. Cleanup
 removes only a clean, harness-owned worktree and retains its branch, refusing a dirty worktree so
@@ -224,6 +292,41 @@ This is defense in depth, not same-user isolation. A local process may still rea
 or explicitly addressed executables through OS facilities the CLIs do not sandbox. Use the harness
 only with repositories and referenced files you trust. The controller itself intentionally uses your
 normal `gh` credentials to read and publish PR reviews.
+
+### The Slack question channel widens this boundary
+
+`--slack` is off by default because it is a real widening, not a cosmetic one. When it is on, the
+Slack process is the single Claude invocation in this harness that can reach the network.
+
+What contains it: it is a separate process from every planning and implementation agent, launched
+from a fresh empty temporary directory, given no repository access and no `--add-dir`, so the run
+artifacts holding your plan, task prompt, and referenced context files are out of its reach. It
+cannot use `--safe-mode`, because that flag is precisely what disables the connector, so hooks,
+skills, settings sources, and memory are each disabled explicitly instead. Its tool allowlist is
+`sleep`, one Slack send tool, and one Slack read tool.
+
+What does not contain it, stated plainly:
+
+- The set of MCP servers cannot be narrowed. Enabling the Slack connector enables every connector
+  configured for that Claude installation. The tool allowlist is what keeps the others unusable;
+  that is an allowlist, not isolation.
+- Reply provenance is reported by a language model. The controller validates every field in Python
+  against a recorded send receipt, a strictly monotonic cursor, the set of timestamps this run
+  itself posted, the thread, and the configured sender, and it caps and JSON-quotes reply text
+  before it reaches any prompt. That makes a stale message, an unrelated DM, a concurrent run's
+  traffic, or the harness's own clarification unable to become an answer. It raises the bar against
+  a fabricated message; it does not make fabrication impossible.
+- Sender identity alone proves nothing here. The connector posts as the authenticated user, so in a
+  self-DM the harness's own messages carry the same sender id as your replies. The outbound
+  timestamp record is the discriminator that actually works.
+- Separating two concurrent runs rests on the controller lock, not on provenance. The outbound
+  timestamp record is per-run, and an unthreaded reply intended for another run would satisfy every
+  provenance check. `controller_lock` allows one controller per repository at a time, which is what
+  makes that unreachable; the run identifier printed in each message is for your benefit, not a
+  validated field. Do not weaken that lock while this feature is enabled.
+- Clarification answers are repository-derived by design. The planner reads the worktree to answer
+  your follow-up, and that answer is sent to Slack. That is the intended feature, and it means
+  repository content leaves the machine when you ask a follow-up question.
 
 ## Development
 

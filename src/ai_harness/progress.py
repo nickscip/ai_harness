@@ -49,6 +49,8 @@ _STAGE_LABELS = {
 def stage_label(name: str) -> str:
     if name.startswith("plan-r") and name.removeprefix("plan-r").isdigit():
         return "repository-grounded plan after human input"
+    if name.startswith("clarify-r"):
+        return "answer to a human follow-up question"
     return _STAGE_LABELS.get(name, name.replace("-", " "))
 
 

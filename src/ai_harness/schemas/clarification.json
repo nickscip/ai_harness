@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "answer": {"type": "string", "minLength": 1},
+    "still_blocking": {"type": "boolean"}
+  },
+  "required": ["answer", "still_blocking"]
+}
