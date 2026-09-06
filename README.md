@@ -130,6 +130,20 @@ successful run leaves a clean, committed `ai-harness/<run-id>` branch in a retai
 <repo-parent>/.ai-harness-worktrees/<repo>/<run-id>
 ```
 
+Repositories that need ignored build inputs before planning can explicitly enable a GNU Make
+bootstrap. Put the exact marker in the top-level `GNUmakefile`, `makefile`, or `Makefile`; the target
+itself may be declared there or in an included file:
+
+```make
+# ai-harness: worktree-setup
+
+worktree-setup:
+	# install dependencies or copy ignored inputs
+```
+
+The harness passes `ENV_SOURCE=<caller-checkout>/.env` and runs the target under the configured
+per-stage timeout. It never evaluates Make syntax while checking for the opt-in marker.
+
 The branch is pushed, its draft PR URL is printed, and the cross-family implementation review is
 published against the exact commit. To stop after verified implementation and leave the changes
 uncommitted locally, opt out explicitly:

@@ -17,7 +17,6 @@ from .github import (
     repository_name,
 )
 from .pr import create_local_review, execute_review, publish_local_review
-from .process import controller_env, run_command
 from .progress import ProgressCallback
 from .prompts import (
     task_command_repair_prompt,
@@ -46,25 +45,36 @@ from .state import RunStore, new_run_id, sha256_bytes
 
 WORKTREE_SETUP_TARGET = "worktree-setup"
 _MAKEFILE_NAMES = ("GNUmakefile", "makefile", "Makefile")
-_MAKE_DATABASE_PROBE_TARGET = "__ai_harness_make_probe__"
+_WORKTREE_SETUP_MARKER = b"# ai-harness: worktree-setup"
+_MAX_WORKTREE_SETUP_MARKER_BYTES = 1_000_000
 
 
-def _make_database_declares_target(database: str, target: str) -> bool:
-    _, marker, files = database.partition("# Files")
-    if not marker:
-        raise HarnessError("Could not inspect worktree setup target: malformed make database")
-    declaration = f"{target}:"
-    for record in files.split("\n\n"):
-        lines = record.splitlines()
-        if "# Not a target:" not in lines and any(
-            line.startswith(declaration) for line in lines
-        ):
-            return True
-    return False
+def _worktree_setup_enabled(makefile: Path) -> bool:
+    scanned = 0
+    try:
+        with makefile.open("rb") as handle:
+            while True:
+                line = handle.readline(_MAX_WORKTREE_SETUP_MARKER_BYTES - scanned + 1)
+                if not line:
+                    return False
+                scanned += len(line)
+                if scanned > _MAX_WORKTREE_SETUP_MARKER_BYTES:
+                    raise HarnessError(
+                        "Could not inspect worktree setup opt-in: opt-in scan exceeds "
+                        f"{_MAX_WORKTREE_SETUP_MARKER_BYTES} bytes"
+                    )
+                logical_line = line[:-1] if line.endswith(b"\n") else line
+                logical_line = (
+                    logical_line[:-1] if logical_line.endswith(b"\r") else logical_line
+                )
+                if logical_line == _WORKTREE_SETUP_MARKER:
+                    return True
+    except OSError as exc:
+        raise HarnessError(f"Could not inspect worktree setup opt-in: {exc}") from exc
 
 
 def worktree_setup_command(worktree: Path, source_repo: Path) -> list[str] | None:
-    """A project opts into worktree bootstrap by declaring a `worktree-setup` make target.
+    """Return the explicitly enabled worktree bootstrap command without evaluating Make.
 
     A fresh worktree has no ignored build inputs — no virtualenv, no node_modules, no
     `.env` — so verification commands fail until the project installs them itself.
@@ -73,22 +83,7 @@ def worktree_setup_command(worktree: Path, source_repo: Path) -> list[str] | Non
     makefile = next((path for path in candidates if path.is_file()), None)
     if makefile is None:
         return None
-    probe_env = controller_env()
-    probe_env.pop("MAKEFILES", None)
-    probe_env["LC_ALL"] = "C"
-    database = run_command(
-        ["make", "-qp", "-f", "-", "-f", str(makefile), _MAKE_DATABASE_PROBE_TARGET],
-        cwd=worktree,
-        env=probe_env,
-        input_text=f"{_MAKE_DATABASE_PROBE_TARGET}:\n",
-        check=False,
-    )
-    if database.returncode not in {0, 1}:
-        detail = database.stderr.strip() or database.stdout.strip()
-        raise HarnessError(
-            f"Could not inspect worktree setup target ({database.returncode}):\n{detail[-2000:]}"
-        )
-    if not _make_database_declares_target(database.stdout, WORKTREE_SETUP_TARGET):
+    if not _worktree_setup_enabled(makefile):
         return None
     return ["make", WORKTREE_SETUP_TARGET, f"ENV_SOURCE={source_repo / '.env'}"]
 
@@ -107,12 +102,6 @@ def _bootstrap_worktree(
     store.begin_stage("worktree-bootstrap", "controller")
     try:
         argv = worktree_setup_command(worktree, source_repo)
-        changed = repo.status(cwd=worktree)
-        if changed:
-            raise HarnessError(
-                "Worktree setup inspection changed the worktree: "
-                + ", ".join(item.path for item in changed)
-            )
         if argv is None:
             bootstrap = {"ran": False, "commands": []}
         else:

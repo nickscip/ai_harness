@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -499,7 +500,9 @@ class _PlanOnlyRunner:
 
 def _commit_makefile(git_repo: GitRepo, recipe: str, *, gitignore: str = "") -> None:
     (git_repo.root / "Makefile").write_text(
-        f"ENV_SOURCE ?= ../../ai/.env\n\nworktree-setup:\n\t{recipe}\n", encoding="utf-8"
+        "# ai-harness: worktree-setup\n\n"
+        f"ENV_SOURCE ?= ../../ai/.env\n\nworktree-setup:\n\t{recipe}\n",
+        encoding="utf-8",
     )
     paths = ["Makefile"]
     if gitignore:
@@ -522,11 +525,46 @@ def test_worktree_setup_command_is_opt_in_per_project(tmp_path: Path) -> None:
     (worktree / "Makefile").write_text(
         "worktree-setup: worktree-copy-env install\n", encoding="utf-8"
     )
+    assert worktree_setup_command(worktree, source) is None
+
+    (worktree / "Makefile").write_text(
+        "# ai-harness: worktree-setup\n\nworktree-setup: worktree-copy-env install\n",
+        encoding="utf-8",
+    )
     assert worktree_setup_command(worktree, source) == [
         "make",
         "worktree-setup",
         f"ENV_SOURCE={source / '.env'}",
     ]
+
+
+@pytest.mark.parametrize(
+    "lookalike",
+    [
+        " # ai-harness: worktree-setup",
+        "\t# ai-harness: worktree-setup",
+        "# ai-harness: worktree-setup ",
+    ],
+)
+def test_worktree_setup_command_requires_exact_marker_line(
+    tmp_path: Path, lookalike: str
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "Makefile").write_text(
+        f"{lookalike}\n\nworktree-setup:\n\t@true\n", encoding="utf-8"
+    )
+
+    assert worktree_setup_command(worktree, tmp_path / "source") is None
+
+
+def test_worktree_setup_command_bounds_marker_scan(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "Makefile").write_bytes(b"x" * 1_000_001)
+
+    with pytest.raises(HarnessError, match="opt-in scan exceeds 1000000 bytes"):
+        worktree_setup_command(worktree, tmp_path / "source")
 
 
 @pytest.mark.parametrize("makefile_name", ["GNUmakefile", "makefile"])
@@ -536,7 +574,10 @@ def test_worktree_setup_command_uses_standard_makefile_names(
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     source = tmp_path / "source"
-    (worktree / makefile_name).write_text("worktree-setup:\n\t@true\n", encoding="utf-8")
+    (worktree / makefile_name).write_text(
+        "# ai-harness: worktree-setup\n\nworktree-setup:\n\t@true\n",
+        encoding="utf-8",
+    )
 
     assert worktree_setup_command(worktree, source) == [
         "make",
@@ -551,7 +592,9 @@ def test_worktree_setup_command_uses_make_parsing_for_included_multi_target_rule
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     source = tmp_path / "source"
-    (worktree / "Makefile").write_text("include setup.mk\n", encoding="utf-8")
+    (worktree / "Makefile").write_text(
+        "# ai-harness: worktree-setup\n\ninclude setup.mk\n", encoding="utf-8"
+    )
     (worktree / "setup.mk").write_text(
         "  prepare worktree-setup: install\n\t@true\n\ninstall:\n\t@true\n",
         encoding="utf-8",
@@ -569,6 +612,7 @@ def test_worktree_setup_command_does_not_build_the_project_default_goal(tmp_path
     worktree.mkdir()
     source = tmp_path / "source"
     (worktree / "Makefile").write_text(
+        "# ai-harness: worktree-setup\n\n"
         ".DEFAULT_GOAL := broken\n\nbroken: missing-input\n\nworktree-setup:\n\t@true\n",
         encoding="utf-8",
     )
@@ -578,14 +622,6 @@ def test_worktree_setup_command_does_not_build_the_project_default_goal(tmp_path
         "worktree-setup",
         f"ENV_SOURCE={source / '.env'}",
     ]
-
-
-def test_worktree_setup_command_ignores_prerequisite_without_a_rule(tmp_path: Path) -> None:
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    (worktree / "Makefile").write_text("all: worktree-setup\n", encoding="utf-8")
-
-    assert worktree_setup_command(worktree, tmp_path / "source") is None
 
 
 def test_worktree_setup_command_ignores_ambient_makefiles(
@@ -601,57 +637,52 @@ def test_worktree_setup_command_ignores_ambient_makefiles(
     assert worktree_setup_command(worktree, tmp_path / "source") is None
 
 
-def test_worktree_setup_command_sanitizes_probe_environment(
+def test_worktree_setup_command_does_not_evaluate_non_opted_in_makefile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     (worktree / "Makefile").write_text(
-        'PROBE := $(shell if test -n "$$GH_TOKEN"; then touch leaked-token; fi)\n\n'
+        'PROBE := $(shell if test -n "$$AWS_SECRET_ACCESS_KEY"; then touch leaked-secret; fi)\n\n'
         "install:\n\t@true\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("GH_TOKEN", "not-a-real-token")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "not-a-real-secret")
 
     assert worktree_setup_command(worktree, tmp_path / "source") is None
-    assert not (worktree / "leaked-token").exists()
+    assert not (worktree / "leaked-secret").exists()
 
 
-def test_worktree_setup_command_uses_stable_make_database_locale(tmp_path: Path) -> None:
+def test_worktree_setup_command_does_not_evaluate_opted_in_makefile(tmp_path: Path) -> None:
     worktree = tmp_path / "worktree"
     worktree.mkdir()
+    source = tmp_path / "source"
     (worktree / "Makefile").write_text(
-        'PROBE := $(shell printf "%s" "$$LC_ALL" > probe-locale)\n\ninstall:\n\t@true\n',
+        "# ai-harness: worktree-setup\n\n"
+        "PROBE := $(shell touch discovery-ran)\n\nworktree-setup:\n\t@true\n",
         encoding="utf-8",
     )
 
-    assert worktree_setup_command(worktree, tmp_path / "source") is None
-    assert (worktree / "probe-locale").read_text(encoding="utf-8") == "C"
+    assert worktree_setup_command(worktree, source) == [
+        "make",
+        "worktree-setup",
+        f"ENV_SOURCE={source / '.env'}",
+    ]
+    assert not (worktree / "discovery-ran").exists()
 
 
-def test_worktree_setup_command_fails_when_makefile_cannot_be_loaded(tmp_path: Path) -> None:
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    (worktree / "Makefile").write_text("include missing.mk\n", encoding="utf-8")
-
-    with pytest.raises(HarnessError, match="Could not inspect worktree setup target"):
-        worktree_setup_command(worktree, tmp_path / "source")
-
-
-@pytest.mark.parametrize("declares_setup", [False, True])
-def test_worktree_setup_inspection_rejects_tracked_changes_before_run_or_skip(
-    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch, declares_setup: bool
+def test_worktree_setup_fails_when_opted_in_makefile_cannot_be_loaded(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    setup_rule = "\nworktree-setup:\n\t@true\n" if declares_setup else ""
     (git_repo.root / "Makefile").write_text(
-        "PROBE := $(shell echo changed > tracked.txt)\n\ninstall:\n\t@true\n" + setup_rule,
+        "# ai-harness: worktree-setup\n\ninclude missing.mk\n\nworktree-setup:\n\t@true\n",
         encoding="utf-8",
     )
     run_command(["git", "add", "Makefile"], cwd=git_repo.root)
-    run_command(["git", "commit", "-m", "add make probe"], cwd=git_repo.root)
+    run_command(["git", "commit", "-m", "add broken makefile"], cwd=git_repo.root)
     monkeypatch.setattr("ai_harness.task.ProviderRunner", _PlanOnlyRunner)
 
-    with pytest.raises(HarnessError, match="Worktree setup inspection changed the worktree"):
+    with pytest.raises(HarnessError, match="missing.mk"):
         start_task(
             git_repo,
             config=HarnessConfig(),
@@ -693,6 +724,35 @@ def test_worktree_setup_that_dirties_tracked_files_fails_the_run(
         start_task(
             git_repo,
             config=HarnessConfig(),
+            prompt="Add result.txt",
+            references=[],
+        )
+
+
+def test_worktree_setup_execution_uses_stage_timeout(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _commit_makefile(git_repo, "@true")
+    fake_bin = git_repo.root.parent / "fake-bin"
+    fake_bin.mkdir()
+    fake_make = fake_bin / "make"
+    fake_make.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "import time\n"
+        "if '-qp' in sys.argv:\n"
+        "    raise SystemExit(86)\n"
+        "time.sleep(3)\n",
+        encoding="utf-8",
+    )
+    fake_make.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr("ai_harness.task.ProviderRunner", _PlanOnlyRunner)
+
+    with pytest.raises(HarnessError, match="timed out after 1s: make"):
+        start_task(
+            git_repo,
+            config=HarnessConfig(stage_timeout=1),
             prompt="Add result.txt",
             references=[],
         )
