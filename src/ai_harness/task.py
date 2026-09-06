@@ -43,6 +43,94 @@ from .slack import (
 )
 from .state import RunStore, new_run_id, sha256_bytes
 
+WORKTREE_SETUP_TARGET = "worktree-setup"
+_MAKEFILE_NAMES = ("GNUmakefile", "makefile", "Makefile")
+_WORKTREE_SETUP_MARKER = b"# ai-harness: worktree-setup"
+_MAX_WORKTREE_SETUP_MARKER_BYTES = 1_000_000
+
+
+def _worktree_setup_enabled(makefile: Path) -> bool:
+    scanned = 0
+    try:
+        with makefile.open("rb") as handle:
+            while True:
+                line = handle.readline(_MAX_WORKTREE_SETUP_MARKER_BYTES - scanned + 1)
+                if not line:
+                    return False
+                scanned += len(line)
+                if scanned > _MAX_WORKTREE_SETUP_MARKER_BYTES:
+                    raise HarnessError(
+                        "Could not inspect worktree setup opt-in: opt-in scan exceeds "
+                        f"{_MAX_WORKTREE_SETUP_MARKER_BYTES} bytes"
+                    )
+                logical_line = line[:-1] if line.endswith(b"\n") else line
+                logical_line = (
+                    logical_line[:-1] if logical_line.endswith(b"\r") else logical_line
+                )
+                if logical_line == _WORKTREE_SETUP_MARKER:
+                    return True
+    except OSError as exc:
+        raise HarnessError(f"Could not inspect worktree setup opt-in: {exc}") from exc
+
+
+def worktree_setup_command(worktree: Path, source_repo: Path) -> list[str] | None:
+    """Return the explicitly enabled worktree bootstrap command without evaluating Make.
+
+    A fresh worktree has no ignored build inputs — no virtualenv, no node_modules, no
+    `.env` — so verification commands fail until the project installs them itself.
+    """
+    candidates = (worktree / name for name in _MAKEFILE_NAMES)
+    makefile = next((path for path in candidates if path.is_file()), None)
+    if makefile is None:
+        return None
+    if not _worktree_setup_enabled(makefile):
+        return None
+    return ["make", WORKTREE_SETUP_TARGET, f"ENV_SOURCE={source_repo / '.env'}"]
+
+
+def _bootstrap_worktree(
+    store: RunStore,
+    repo: GitRepo,
+    *,
+    worktree: Path,
+    source_repo: Path,
+    timeout: int,
+) -> dict[str, Any]:
+    bootstrap = store.read_completed_stage("worktree-bootstrap")
+    if bootstrap is not None:
+        return bootstrap
+    store.begin_stage("worktree-bootstrap", "controller")
+    try:
+        argv = worktree_setup_command(worktree, source_repo)
+        if argv is None:
+            bootstrap = {"ran": False, "commands": []}
+        else:
+            command_results = execute_planned_commands(
+                [
+                    {
+                        "argv": argv,
+                        "cwd": ".",
+                        "purpose": "Install the ignored build inputs this worktree needs.",
+                        "timeout_seconds": timeout,
+                    }
+                ],
+                worktree=worktree,
+                preparation=True,
+                progress=store.progress,
+            )
+            changed = repo.status(cwd=worktree)
+            if changed:
+                raise HarnessError(
+                    "Worktree setup changed the worktree: "
+                    + ", ".join(item.path for item in changed)
+                )
+            bootstrap = {"ran": True, "commands": command_results}
+        store.complete_stage("worktree-bootstrap", bootstrap)
+        return bootstrap
+    except Exception as exc:
+        store.fail_stage("worktree-bootstrap", str(exc))
+        raise
+
 
 def start_task(
     repo: GitRepo,
@@ -847,6 +935,14 @@ def execute_task(
     context_dir = store.root / "context"
     context_dirs = (context_dir,) if context_dir.is_dir() else ()
     git_admin = repo.git_admin_dir(worktree)
+
+    _bootstrap_worktree(
+        store,
+        repo,
+        worktree=worktree,
+        source_repo=Path(str(state["source_repo"])),
+        timeout=config.stage_timeout,
+    )
 
     def record_spend(total: float) -> None:
         current = store.load()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -7,8 +8,9 @@ import pytest
 from ai_harness.config import HarnessConfig
 from ai_harness.errors import AwaitingInput, HarnessError
 from ai_harness.git import GitRepo
+from ai_harness.process import run_command
 from ai_harness.state import RunStore, list_runs
-from ai_harness.task import execute_task, start_task
+from ai_harness.task import execute_task, start_task, worktree_setup_command
 
 
 def _plan() -> dict[str, object]:
@@ -463,3 +465,310 @@ def test_delivery_commits_reviews_pushes_opens_draft_pr_and_publishes(
         lambda *args: (_ for _ in ()).throw(AssertionError("must not push twice")),
     )
     execute_task(store, git_repo, HarnessConfig())
+
+
+class _PlanOnlyRunner:
+    """Drive the pipeline without providers so bootstrap behaviour is what fails or passes."""
+
+    def __init__(self, config, store: RunStore):
+        self.store = store
+
+    def run(self, request):
+        self.store.begin_stage(request.stage, request.family)
+        if request.stage == "plan":
+            value = _plan()
+        elif request.stage == "plan-review":
+            value = {
+                "verdict": "approve",
+                "summary": "No defects.",
+                "findings": [],
+                "required_changes": [],
+            }
+        elif request.stage == "revised-plan":
+            value = _revised_plan()
+        else:
+            (request.cwd / "result.txt").write_text("implemented\n", encoding="utf-8")
+            value = {
+                "summary": "Implemented.",
+                "changed_files": ["result.txt"],
+                "verification_requested": [],
+                "notes": [],
+            }
+        self.store.complete_stage(request.stage, value)
+        return value
+
+
+def _commit_makefile(git_repo: GitRepo, recipe: str, *, gitignore: str = "") -> None:
+    (git_repo.root / "Makefile").write_text(
+        "# ai-harness: worktree-setup\n\n"
+        f"ENV_SOURCE ?= ../../ai/.env\n\nworktree-setup:\n\t{recipe}\n",
+        encoding="utf-8",
+    )
+    paths = ["Makefile"]
+    if gitignore:
+        (git_repo.root / ".gitignore").write_text(gitignore, encoding="utf-8")
+        paths.append(".gitignore")
+    run_command(["git", "add", *paths], cwd=git_repo.root)
+    run_command(["git", "commit", "-m", "add makefile"], cwd=git_repo.root)
+
+
+def test_worktree_setup_command_is_opt_in_per_project(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    source = tmp_path / "source"
+
+    assert worktree_setup_command(worktree, source) is None
+
+    (worktree / "Makefile").write_text("install:\n\techo hi\n", encoding="utf-8")
+    assert worktree_setup_command(worktree, source) is None
+
+    (worktree / "Makefile").write_text(
+        "worktree-setup: worktree-copy-env install\n", encoding="utf-8"
+    )
+    assert worktree_setup_command(worktree, source) is None
+
+    (worktree / "Makefile").write_text(
+        "# ai-harness: worktree-setup\n\nworktree-setup: worktree-copy-env install\n",
+        encoding="utf-8",
+    )
+    assert worktree_setup_command(worktree, source) == [
+        "make",
+        "worktree-setup",
+        f"ENV_SOURCE={source / '.env'}",
+    ]
+
+
+@pytest.mark.parametrize(
+    "lookalike",
+    [
+        " # ai-harness: worktree-setup",
+        "\t# ai-harness: worktree-setup",
+        "# ai-harness: worktree-setup ",
+    ],
+)
+def test_worktree_setup_command_requires_exact_marker_line(
+    tmp_path: Path, lookalike: str
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "Makefile").write_text(
+        f"{lookalike}\n\nworktree-setup:\n\t@true\n", encoding="utf-8"
+    )
+
+    assert worktree_setup_command(worktree, tmp_path / "source") is None
+
+
+def test_worktree_setup_command_bounds_marker_scan(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "Makefile").write_bytes(b"x" * 1_000_001)
+
+    with pytest.raises(HarnessError, match="opt-in scan exceeds 1000000 bytes"):
+        worktree_setup_command(worktree, tmp_path / "source")
+
+
+@pytest.mark.parametrize("makefile_name", ["GNUmakefile", "makefile"])
+def test_worktree_setup_command_uses_standard_makefile_names(
+    tmp_path: Path, makefile_name: str
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    source = tmp_path / "source"
+    (worktree / makefile_name).write_text(
+        "# ai-harness: worktree-setup\n\nworktree-setup:\n\t@true\n",
+        encoding="utf-8",
+    )
+
+    assert worktree_setup_command(worktree, source) == [
+        "make",
+        "worktree-setup",
+        f"ENV_SOURCE={source / '.env'}",
+    ]
+
+
+def test_worktree_setup_command_uses_make_parsing_for_included_multi_target_rule(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    source = tmp_path / "source"
+    (worktree / "Makefile").write_text(
+        "# ai-harness: worktree-setup\n\ninclude setup.mk\n", encoding="utf-8"
+    )
+    (worktree / "setup.mk").write_text(
+        "  prepare worktree-setup: install\n\t@true\n\ninstall:\n\t@true\n",
+        encoding="utf-8",
+    )
+
+    assert worktree_setup_command(worktree, source) == [
+        "make",
+        "worktree-setup",
+        f"ENV_SOURCE={source / '.env'}",
+    ]
+
+
+def test_worktree_setup_command_does_not_build_the_project_default_goal(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    source = tmp_path / "source"
+    (worktree / "Makefile").write_text(
+        "# ai-harness: worktree-setup\n\n"
+        ".DEFAULT_GOAL := broken\n\nbroken: missing-input\n\nworktree-setup:\n\t@true\n",
+        encoding="utf-8",
+    )
+
+    assert worktree_setup_command(worktree, source) == [
+        "make",
+        "worktree-setup",
+        f"ENV_SOURCE={source / '.env'}",
+    ]
+
+
+def test_worktree_setup_command_ignores_ambient_makefiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "Makefile").write_text("install:\n\t@true\n", encoding="utf-8")
+    ambient = tmp_path / "ambient.mk"
+    ambient.write_text("worktree-setup:\n\t@true\n", encoding="utf-8")
+    monkeypatch.setenv("MAKEFILES", str(ambient))
+
+    assert worktree_setup_command(worktree, tmp_path / "source") is None
+
+
+def test_worktree_setup_command_does_not_evaluate_non_opted_in_makefile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "Makefile").write_text(
+        'PROBE := $(shell if test -n "$$AWS_SECRET_ACCESS_KEY"; then touch leaked-secret; fi)\n\n'
+        "install:\n\t@true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "not-a-real-secret")
+
+    assert worktree_setup_command(worktree, tmp_path / "source") is None
+    assert not (worktree / "leaked-secret").exists()
+
+
+def test_worktree_setup_command_does_not_evaluate_opted_in_makefile(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    source = tmp_path / "source"
+    (worktree / "Makefile").write_text(
+        "# ai-harness: worktree-setup\n\n"
+        "PROBE := $(shell touch discovery-ran)\n\nworktree-setup:\n\t@true\n",
+        encoding="utf-8",
+    )
+
+    assert worktree_setup_command(worktree, source) == [
+        "make",
+        "worktree-setup",
+        f"ENV_SOURCE={source / '.env'}",
+    ]
+    assert not (worktree / "discovery-ran").exists()
+
+
+def test_worktree_setup_fails_when_opted_in_makefile_cannot_be_loaded(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (git_repo.root / "Makefile").write_text(
+        "# ai-harness: worktree-setup\n\ninclude missing.mk\n\nworktree-setup:\n\t@true\n",
+        encoding="utf-8",
+    )
+    run_command(["git", "add", "Makefile"], cwd=git_repo.root)
+    run_command(["git", "commit", "-m", "add broken makefile"], cwd=git_repo.root)
+    monkeypatch.setattr("ai_harness.task.ProviderRunner", _PlanOnlyRunner)
+
+    with pytest.raises(HarnessError, match="missing.mk"):
+        start_task(
+            git_repo,
+            config=HarnessConfig(),
+            prompt="Add result.txt",
+            references=[],
+        )
+
+
+def test_worktree_setup_runs_before_planning_and_installs_ignored_inputs(
+    git_repo: GitRepo, monkeypatch
+) -> None:
+    (git_repo.root / ".env").write_text("SECRET=from-source\n", encoding="utf-8")
+    _commit_makefile(git_repo, 'cp "$(ENV_SOURCE)" .', gitignore=".env\n")
+    monkeypatch.setattr("ai_harness.task.ProviderRunner", _PlanOnlyRunner)
+
+    store = start_task(
+        git_repo,
+        config=HarnessConfig(),
+        prompt="Add result.txt",
+        references=[],
+    )
+
+    state = store.load()
+    worktree = Path(state["result"]["worktree"])
+    bootstrap = store.read_completed_stage("worktree-bootstrap")
+    assert bootstrap is not None and bootstrap["ran"] is True
+    assert (worktree / ".env").read_text(encoding="utf-8") == "SECRET=from-source\n"
+    assert [item.path for item in git_repo.status(cwd=worktree)] == ["result.txt"]
+    assert state["status"] == "completed"
+
+
+def test_worktree_setup_that_dirties_tracked_files_fails_the_run(
+    git_repo: GitRepo, monkeypatch
+) -> None:
+    _commit_makefile(git_repo, "echo setup-touched-a-tracked-file > tracked.txt")
+    monkeypatch.setattr("ai_harness.task.ProviderRunner", _PlanOnlyRunner)
+
+    with pytest.raises(HarnessError, match="Worktree setup changed the worktree: tracked.txt"):
+        start_task(
+            git_repo,
+            config=HarnessConfig(),
+            prompt="Add result.txt",
+            references=[],
+        )
+
+
+def test_worktree_setup_execution_uses_stage_timeout(
+    git_repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _commit_makefile(git_repo, "@true")
+    fake_bin = git_repo.root.parent / "fake-bin"
+    fake_bin.mkdir()
+    fake_make = fake_bin / "make"
+    fake_make.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "import time\n"
+        "if '-qp' in sys.argv:\n"
+        "    raise SystemExit(86)\n"
+        "time.sleep(3)\n",
+        encoding="utf-8",
+    )
+    fake_make.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr("ai_harness.task.ProviderRunner", _PlanOnlyRunner)
+
+    with pytest.raises(HarnessError, match="timed out after 1s: make"):
+        start_task(
+            git_repo,
+            config=HarnessConfig(stage_timeout=1),
+            prompt="Add result.txt",
+            references=[],
+        )
+
+
+def test_missing_makefile_records_a_skipped_bootstrap_stage(
+    git_repo: GitRepo, monkeypatch
+) -> None:
+    monkeypatch.setattr("ai_harness.task.ProviderRunner", _PlanOnlyRunner)
+
+    store = start_task(
+        git_repo,
+        config=HarnessConfig(),
+        prompt="Add result.txt",
+        references=[],
+    )
+
+    bootstrap = store.read_completed_stage("worktree-bootstrap")
+    assert bootstrap == {"ran": False, "commands": []}

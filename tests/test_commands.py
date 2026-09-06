@@ -83,6 +83,42 @@ def test_corepack_fallback_disables_manifest_auto_pin(monkeypatch: pytest.Monkey
     assert env["COREPACK_ENABLE_AUTO_PIN"] == "0"
 
 
+def test_missing_python_falls_back_to_python3(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_which(command: str, *, path: str | None = None) -> str | None:
+        return "/controller/bin/python3" if command == "python3" else None
+
+    monkeypatch.setattr("ai_harness.commands.shutil.which", fake_which)
+
+    assert resolve_controller_argv(
+        ["python", "-m", "unittest", "discover"], {"PATH": "/controller/bin"}
+    ) == ["python3", "-m", "unittest", "discover"]
+
+
+def test_missing_python3_does_not_fall_back_to_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_which(command: str, *, path: str | None = None) -> str | None:
+        return "/controller/bin/python" if command == "python" else None
+
+    monkeypatch.setattr("ai_harness.commands.shutil.which", fake_which)
+
+    assert resolve_controller_argv(["python3", "-m", "pytest"], {"PATH": "/controller/bin"}) == [
+        "python3",
+        "-m",
+        "pytest",
+    ]
+
+
+def test_missing_interpreter_without_fallback_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("ai_harness.commands.shutil.which", lambda command, *, path=None: None)
+
+    assert resolve_controller_argv(["python", "-m", "unittest"], {"PATH": "/controller/bin"}) == [
+        "python",
+        "-m",
+        "unittest",
+    ]
+
+
 def test_available_package_manager_is_not_rewritten(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "ai_harness.commands.shutil.which",
