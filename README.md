@@ -70,10 +70,21 @@ ai-harness config --profile claude-opus
 ```
 
 The root [`council-profiles.json`](council-profiles.json) file is the editable source of truth for
-named profiles. Select one per run with `--profile NAME`, or set `AI_HARNESS_PROFILE`. A profile
-chooses the primary family, that family's model and effort, the timeout, and an optional Claude
-fallback model. The other family still participates as the adversary using its configured
-counterpart model.
+named profiles. Select one per run with `--profile NAME`, or set `AI_HARNESS_PROFILE`. The profile's
+`provider` is the primary family, and there is no way to override it independently: swapping which
+family plans and implements means selecting a different profile. A profile also chooses that
+family's model and effort, the timeout, and an optional Claude fallback model. The other family
+participates as the adversary using its configured counterpart model.
+
+A profile may also pin the adversarial family instead of accepting its defaults, and opt into a
+final feedback pass:
+
+| Profile field | Effect |
+|---|---|
+| `critic_model` | Model the adversarial family uses; defaults to that family's counterpart |
+| `critic_effort` | Reasoning effort for the adversarial family |
+| `critic_fast` | Request Codex's `priority` (fast) speed tier for adversarial stages |
+| `apply_review` | After publishing the implementation review, have the primary family apply its findings and update the pull request |
 
 Configuration resolves in this order: command-line flags, `AI_HARNESS_*` environment variables,
 the selected profile, then built-in library defaults. The common settings are:
@@ -81,10 +92,11 @@ the selected profile, then built-in library defaults. The common settings are:
 | Setting | CLI flag | Environment variable | Default |
 |---|---|---|---|
 | Named profile | `--profile` | `AI_HARNESS_PROFILE` | `codex-balanced` |
-| Primary family | `--family` | `AI_HARNESS_FAMILY` | selected profile |
 | Claude model | `--claude-model` | `AI_HARNESS_CLAUDE_MODEL` | `sonnet` |
 | Codex model | `--codex-model` | `AI_HARNESS_CODEX_MODEL` | `gpt-5.6-terra` |
 | Codex reasoning | — | `AI_HARNESS_CODEX_REASONING` | `medium` |
+| Codex fast speed tier | — | `AI_HARNESS_CODEX_FAST` | selected profile |
+| Apply PR review feedback | — | `AI_HARNESS_APPLY_REVIEW` | selected profile |
 | Per-agent timeout | `--timeout` | `AI_HARNESS_TIMEOUT` | selected profile |
 | Ask planning questions on Slack | `--slack` | `AI_HARNESS_SLACK` | off |
 | Slack user to ask | — | `AI_HARNESS_SLACK_USER` | none |
@@ -107,12 +119,23 @@ and review publication:
 
 ```sh
 ai-harness "Add bounded retries to the upload worker and test the exhausted path"
-ai-harness --family codex --timeout 1200 "Refactor the parser without changing its API"
+ai-harness --profile codex-deep --timeout 1200 "Refactor the parser without changing its API"
 ```
 
 The default `codex-balanced` profile uses Codex `gpt-5.6-terra` with medium reasoning as the primary
 family and Claude Sonnet as the adversarial family. Swap the complete primary profile with
 `--profile`, or override individual values with model flags and `AI_HARNESS_*` variables.
+
+The `claude-fable` profile runs the same workflow with Claude Fable at high effort as the primary
+family and Codex `gpt-5.6-sol` at `xhigh` on the fast speed tier as the adversary. It sets
+`apply_review`, so the run does not stop at the published review: Fable applies the findings,
+the plan's verification commands re-run, and the fix lands as a second commit on the same branch,
+updating the draft pull request in place. Findings Fable argues down are recorded in that stage's
+`notes` rather than acted on.
+
+```sh
+ai-harness --profile claude-fable "Add bounded retries to the upload worker"
+```
 
 An `@path` argument is copied to a neutral, checksummed run artifact and explicitly given to each
 stage. This prevents either CLI from interpreting the original `@` token itself:

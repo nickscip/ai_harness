@@ -220,6 +220,41 @@ Return only
 the structured implementation summary after edits are complete."""
 
 
+def task_review_feedback_prompt(
+    user_prompt: str,
+    review_path: Path,
+    findings_path: Path,
+    context: str,
+) -> str:
+    return f"""{_repository_preamble()}
+
+PUBLISHED PULL REQUEST REVIEW
+Read {review_path}
+
+STRUCTURED REVIEW FINDINGS
+Read {findings_path}
+
+ORIGINAL TASK
+{json.dumps(user_prompt)}
+
+SUPPLEMENTAL CONTEXT
+{context}
+
+The implementation for this task is already committed on this branch and published as a draft pull
+request. Apply the review feedback to this worktree. Work through the findings by severity, highest
+first.
+
+A finding is not an order. Where a finding is wrong, already handled, or would cost more than it
+saves, leave the code alone and record the reason in `notes` naming the finding ID. Where it is
+right, make the smallest correct change. Do not restructure code the findings do not touch, and do
+not widen the original task's scope.
+
+Do not run tests, linters, package managers, or arbitrary repository commands; the controller
+re-runs the plan's argv verification after you finish. You may use the allowed read-only history
+inspection commands to see the committed implementation. Do not commit, publish, or access the
+network. Return only the structured implementation summary after edits are complete."""
+
+
 def task_implementation_repair_prompt(
     user_prompt: str,
     revised_plan_path: Path,

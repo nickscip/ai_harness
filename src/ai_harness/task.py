@@ -25,6 +25,7 @@ from .prompts import (
     task_plan_answer_prompt,
     task_plan_clarify_prompt,
     task_plan_prompt,
+    task_review_feedback_prompt,
     task_review_prompt,
     task_revise_prompt,
 )
@@ -162,6 +163,8 @@ def start_task(
             "claude_fallback_model": config.claude_fallback_model,
             "codex_model": config.codex_model,
             "codex_reasoning": config.codex_reasoning,
+            "codex_fast": config.codex_fast,
+            "apply_review": config.apply_review,
             "claude_max_budget_usd": config.claude_max_budget_usd,
             "deliver": deliver,
             "slack_enabled": config.slack_enabled,
@@ -766,8 +769,12 @@ def _deliver_task(
     repo: GitRepo,
     config: HarnessConfig,
     worktree: Path,
+    revised: dict[str, Any],
     implementation: dict[str, Any],
     verification: dict[str, Any],
+    context: str,
+    context_dirs: tuple[Path, ...],
+    runner: ProviderRunner,
 ) -> dict[str, Any]:
     state = store.load()
     branch = str(state["branch"])
@@ -902,11 +909,124 @@ def _deliver_task(
             store.fail_stage("delivery-review-publication", str(exc))
             raise
 
+    feedback: dict[str, Any] | None = None
+    if config.apply_review and int(review["findings"]) > 0:
+        feedback = _apply_review_feedback(
+            store=store,
+            repo=repo,
+            config=config,
+            runner=runner,
+            worktree=worktree,
+            branch=branch,
+            revised=revised,
+            review=review,
+            context=context,
+            context_dirs=context_dirs,
+        )
+
     return {
         "commit": commit["sha"],
         "pull_request": pull,
         "review": {**review, "publication": publication},
+        "feedback": feedback,
     }
+
+
+def _apply_review_feedback(
+    *,
+    store: RunStore,
+    repo: GitRepo,
+    config: HarnessConfig,
+    runner: ProviderRunner,
+    worktree: Path,
+    branch: str,
+    revised: dict[str, Any],
+    review: dict[str, Any],
+    context: str,
+    context_dirs: tuple[Path, ...],
+) -> dict[str, Any]:
+    """Have the primary family apply the published review's findings and update the pull request."""
+    state = store.load()
+    review_store = RunStore(repo.common_git_dir, str(review["run_id"]), progress=store.progress)
+
+    applied = store.read_completed_stage("review-feedback")
+    if applied is None:
+        # This stage is writable, and an `--add-dir` grant is writable with it, so the agent reads
+        # throwaway copies. Handing it the completed review run's own store would put that run's
+        # published evidence, state, and stage checksums inside its write scope.
+        rendered = store.write_text_artifact(
+            "review-feedback/review.md",
+            Path(str(review["review"])).read_text(encoding="utf-8"),
+        )
+        findings = store.write_text_artifact(
+            "review-feedback/review-final.json",
+            (review_store.root / "review-final.json").read_text(encoding="utf-8"),
+        )
+        applied = runner.run(
+            ProviderRequest(
+                family=state["primary_family"],
+                stage="review-feedback",
+                cwd=worktree,
+                prompt=task_review_feedback_prompt(state["prompt"], rendered, findings, context),
+                schema_name="implementation",
+                writable=True,
+                timeout=config.stage_timeout,
+                context_dirs=(*context_dirs, rendered.parent),
+                git_admin_dir=repo.git_admin_dir(worktree),
+            )
+        )
+    else:
+        validate_output("implementation", applied)
+    verify_references(store.load())
+
+    # Committing and pushing are separate resumable stages, as they are for the implementation
+    # delivery above. Committing leaves the worktree clean, so a fused stage that decides "no
+    # changes" from live worktree status would resume into that branch after a failed push and
+    # silently report success with the commit never pushed.
+    committed = store.read_completed_stage("review-feedback-commit")
+    if committed is None:
+        store.begin_stage("review-feedback-commit", "controller")
+        try:
+            changed = [item.path for item in repo.status(cwd=worktree)]
+            if not changed:
+                # Every finding was argued down rather than fixed. The notes are the record.
+                committed = {"changed_paths": [], "commit": "", "commands": []}
+            else:
+                # ponytail: no review-feedback-repair stage. Failing verification aborts the run
+                # with the pull request and review already published, and resume re-runs the same
+                # failing commands. Add a repair round if that turns out to happen in practice.
+                command_results = execute_planned_commands(
+                    revised["verification_commands"],
+                    worktree=worktree,
+                    preparation=False,
+                    progress=store.progress,
+                )
+                committed = {
+                    "changed_paths": changed,
+                    "commit": repo.commit_all(
+                        worktree, "ai-harness: apply pull request review feedback"
+                    ),
+                    "commands": command_results,
+                }
+            store.complete_stage("review-feedback-commit", committed)
+        except Exception as exc:
+            store.fail_stage("review-feedback-commit", str(exc))
+            raise
+
+    if committed["commit"]:
+        pushed = store.read_completed_stage("review-feedback-push")
+        if pushed is None:
+            store.begin_stage("review-feedback-push", "controller")
+            try:
+                repo.push_branch(worktree, branch)
+                store.complete_stage(
+                    "review-feedback-push", {"branch": branch, "sha": committed["commit"]}
+                )
+            except Exception as exc:
+                store.fail_stage("review-feedback-push", str(exc))
+                raise
+
+    return {"summary": applied["summary"], "notes": applied["notes"], **committed}
 
 
 def execute_task(
@@ -1098,7 +1218,14 @@ def execute_task(
     verify_references(store.load())
 
     implementation_status = repo.status(cwd=worktree)
-    if not implementation_status or not implementation["changed_files"]:
+    # An empty worktree only means the implementation produced nothing while its changes are
+    # still uncommitted. Once they are captured, delivery commits them and a clean worktree is
+    # the expected state, so resuming past capture must not re-run the repair: doing so spends a
+    # writable stage that rewrites delivered files from the original plan.
+    captured_already = store.read_completed_stage("implementation-capture") is not None
+    if not captured_already and (
+        not implementation_status or not implementation["changed_files"]
+    ):
         repaired_implementation = store.read_completed_stage("implementation-repair")
         if repaired_implementation is None:
             repaired_implementation = runner.run(
@@ -1181,8 +1308,12 @@ def execute_task(
             repo=repo,
             config=config,
             worktree=worktree,
+            revised=revised,
             implementation=implementation,
             verification=verification,
+            context=context,
+            context_dirs=context_dirs,
+            runner=runner,
         )
 
     final_state = store.load()
