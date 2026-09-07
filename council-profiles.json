@@ -45,6 +45,17 @@
       "fallback_model": "sonnet",
       "effort": "max",
       "timeout_seconds": 1200
+    },
+    "claude-fable": {
+      "description": "Fable plans and implements at high effort; Codex gpt-5.6-sol reviews at xhigh on the fast tier and Fable applies the PR review feedback.",
+      "provider": "claude",
+      "model": "fable",
+      "effort": "high",
+      "critic_model": "gpt-5.6-sol",
+      "critic_effort": "xhigh",
+      "critic_fast": true,
+      "apply_review": true,
+      "timeout_seconds": 1800
     }
   }
 }

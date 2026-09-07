@@ -17,6 +17,10 @@ _PROFILE_KEYS = {
     "fallback_model",
     "effort",
     "timeout_seconds",
+    "critic_model",
+    "critic_effort",
+    "critic_fast",
+    "apply_review",
 }
 
 
@@ -29,6 +33,11 @@ class HarnessProfile:
     effort: str
     timeout_seconds: int
     fallback_model: str = ""
+    # The critic is always the other family, so these fill that family's slots.
+    critic_model: str = ""
+    critic_effort: str = ""
+    critic_fast: bool = False
+    apply_review: bool = False
 
 
 @dataclass(frozen=True)
@@ -87,6 +96,28 @@ def _profile(name: str, value: Any) -> HarnessProfile:
         raise HarnessError(f"Profile {name!r} fallback_model must be a string")
     if provider != "claude" and fallback:
         raise HarnessError(f"Profile {name!r} can only use fallback_model with Claude")
+    critic = "codex" if provider == "claude" else "claude"
+    critic_model = value.get("critic_model", "")
+    if not isinstance(critic_model, str):
+        raise HarnessError(f"Profile {name!r} critic_model must be a string")
+    critic_effort = value.get("critic_effort", "")
+    if not isinstance(critic_effort, str):
+        raise HarnessError(f"Profile {name!r} critic_effort must be a string")
+    critic_effort = critic_effort.strip()
+    if critic_effort and critic_effort not in _EFFORTS:
+        raise HarnessError(f"Profile {name!r} has unsupported critic_effort {critic_effort!r}")
+    if critic == "codex" and critic_effort == "max":
+        raise HarnessError(
+            f"Profile {name!r} uses max critic_effort, which Codex does not support"
+        )
+    critic_fast = value.get("critic_fast", False)
+    if not isinstance(critic_fast, bool):
+        raise HarnessError(f"Profile {name!r} critic_fast must be a boolean")
+    if critic_fast and critic != "codex":
+        raise HarnessError(f"Profile {name!r} can only use critic_fast with a Codex critic")
+    apply_review = value.get("apply_review", False)
+    if not isinstance(apply_review, bool):
+        raise HarnessError(f"Profile {name!r} apply_review must be a boolean")
     return HarnessProfile(
         name=name,
         description=_required_string(value, "description", name),
@@ -95,6 +126,10 @@ def _profile(name: str, value: Any) -> HarnessProfile:
         fallback_model=fallback.strip(),
         effort=effort,
         timeout_seconds=timeout,
+        critic_model=critic_model.strip(),
+        critic_effort=critic_effort,
+        critic_fast=critic_fast,
+        apply_review=apply_review,
     )
 
 
