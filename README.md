@@ -217,10 +217,12 @@ the diff and the changed-path list and may request at most three further special
 paths that are actually in the diff. It can add members; it can never remove one.
 
 Specialists run in parallel — `AI_HARNESS_COUNCIL_WORKERS=1` makes them sequential — with families
-alternating across the roster, so every council contains both Claude and Codex. Each returns at
-most five findings, each with a severity, a confidence, an exact changed-line location, and a
-verification that would falsify it. A specialty that does not apply abstains rather than reaching
-for something to say.
+alternating across the roster, so every council contains both Claude and Codex. The review lead runs
+on the primary family; the members that land on the adversarial family use that family's model and
+effort, including a profile's `critic_model` and `critic_effort`. Each returns at most five
+findings, each with a severity, a confidence, an exact changed-line location, and a verification
+that would falsify it. A specialty that does not apply abstains rather than reaching for something
+to say.
 
 The lead then consolidates. It receives the findings as a manifest of untrusted claims identified
 as `<reviewer>:<position>`, and must dispose of every one exactly once — into an accepted group or
