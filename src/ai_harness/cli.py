@@ -95,6 +95,7 @@ def _config_from_state(
         codex_reasoning=str(options.get("codex_reasoning", "medium")),
         stage_timeout=int(options.get("timeout", 900)),
         claude_max_budget_usd=float(options.get("claude_max_budget_usd", 8.0)),
+        council_workers=int(options.get("council_workers", 3)),
         slack_enabled=bool(options.get("slack_enabled", False)) if slack is None else slack,
         slack_user=str(options.get("slack_user", "")),
         slack_wait_seconds=(

@@ -391,6 +391,8 @@ class _ReviewRunner:
             value = _ReviewRunner.reviews.get(member) or _specialist_review(member, [])
         try:
             value = validate_output(request.schema_name, value)
+            if request.contract is not None:
+                value = request.contract(value)
         except ProviderError as exc:
             self.store.fail_stage(request.stage, str(exc))
             raise
@@ -548,6 +550,8 @@ def test_explicit_council_skips_routing_and_gets_its_own_marker(
         "correctness_reviewer",
         "refactorer",
     ]
+    # Concurrency is execution-affecting, so it is recorded for the resume path.
+    assert explicit.load()["options"]["council_workers"] == 3
     # The requested council is part of the review identity, so this is not a repeat.
     assert explicit.load()["review_marker"] != auto.load()["review_marker"]
     assert len(posted) == 2
@@ -557,8 +561,13 @@ def test_council_specialists_are_resumable_one_stage_at_a_time(
     git_repo: GitRepo, review_env
 ) -> None:
     base, served, _ = review_env
-    _ReviewRunner.reviews["refactorer"] = {"reviewer": "refactorer", "verdict": "nonsense"}
-    with pytest.raises(ProviderError, match="refactorer"):
+    # Schema-valid but contract-invalid: a blocker finding without `verdict: block`. The
+    # provider persists the stage before the contract is checked, so this is the case that
+    # could strand a completed-but-unusable specialist.
+    _ReviewRunner.reviews["refactorer"] = _specialist_review(
+        "refactorer", [_specialist_finding(excerpt="new line", severity="blocker")]
+    )
+    with pytest.raises(ProviderError, match="blocker without verdict block"):
         start_review(
             git_repo, config=HarnessConfig(), number=16, prompt="Look", references=[], publish=True
         )
@@ -782,3 +791,34 @@ def test_a_fully_completed_council_replays_its_artifacts_without_a_model(
     assert _ReviewRunner.prompts == []
     assert result["findings"] == 1
     assert result["reviewers"] == ["correctness_reviewer", "refactorer"]
+
+
+def test_a_completed_specialist_that_breaks_the_contract_is_rerun_not_reread(
+    git_repo: GitRepo, review_env
+) -> None:
+    base, served, posted = review_env
+    _ReviewRunner.routing = {
+        "specialist_requests": [],
+        "focus_reviewers": [],
+        "summary": "Floor only.",
+    }
+    store = create_local_review(
+        git_repo,
+        config=HarnessConfig(),
+        base=base,
+        head=served["head"],
+        branch="feature",
+        title="Local change",
+        prompt="Review the implementation",
+        references=[],
+    )
+    # A stage left completed by an earlier version whose payload the contract now rejects.
+    store.begin_stage("review-refactorer", "claude")
+    store.complete_stage("review-refactorer", _specialist_review("correctness_reviewer", []))
+    _ReviewRunner.prompts.clear()
+
+    result = execute_review(store, git_repo, HarnessConfig())
+
+    assert "review-refactorer" in [stage for stage, _ in _ReviewRunner.prompts]
+    assert store.load()["stages"]["review-refactorer"]["status"] == "completed"
+    assert result["findings"] == 2

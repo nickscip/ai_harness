@@ -151,8 +151,10 @@ per-stage timeout. It never evaluates Make syntax while checking for the opt-in 
 
 The branch is pushed, its draft PR URL is printed, and the council's implementation review is
 published against the exact commit. It is the same council described under
-[Pull request usage](#pull-request-usage), on the local branch diff instead of a PR. To stop after verified implementation and leave the changes
-uncommitted locally, opt out explicitly:
+[Pull request usage](#pull-request-usage), on the local branch diff instead of a PR.
+
+To stop after verified implementation and leave the changes uncommitted locally, opt out
+explicitly:
 
 ```sh
 ai-harness --local-only "Experiment with the parser without opening a PR"
@@ -219,6 +221,15 @@ with no correctness reviewer. The always-on floor governs automatic routing.
 The requested council is part of the review identity, so an explicitly selected council publishes
 separately from an automatically routed one at the same head.
 
+Automatic routing is one identity. The review marker covers the repository, PR number, head, prompt,
+and context checksums plus the *requested* council, not the roster the lead happened to pick — so
+re-running the same `/review` command posts nothing the second time even if the lead selects
+different specialists and they find something new. That is deliberate: the marker exists to stop a
+repeated command from accumulating near-duplicate reviews, and a model's routing choice is not a
+stable identity to key publication on. The second run's findings are still written to `review.md`
+and `council-report.md`, and the run reports that it did not publish. To get a second published
+opinion at the same head, name the council explicitly with `--reviewer`, which changes the identity.
+
 ### Publication
 
 Only open PRs under the configured size limits are accepted. Fork heads are fetched through
@@ -228,7 +239,8 @@ than approve/request-changes, and retries a GitHub 422 once as summary-only. An 
 provider-neutral marker makes resume and repeated identical reviews idempotent. Mentions in
 model-authored text are neutralized so a quoted `@team` cannot notify anyone.
 
-Every finding's cited line is re-read from the exact commit and its excerpt compared byte for byte.
+Every finding's cited line is re-read from the exact commit and its excerpt compared to that
+line, ignoring only leading and trailing whitespace.
 A finding whose evidence does not survive that check is published as a summary note without an
 inline location rather than attached to the wrong line.
 

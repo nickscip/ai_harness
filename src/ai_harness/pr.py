@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -373,6 +373,7 @@ def start_review(
             "codex_model": config.codex_model,
             "codex_reasoning": config.codex_reasoning,
             "claude_max_budget_usd": config.claude_max_budget_usd,
+            "council_workers": config.council_workers,
             "publish": publish,
             "pr_number": number,
             "council_members": selection,
@@ -461,6 +462,7 @@ def create_local_review(
             "codex_model": config.codex_model,
             "codex_reasoning": config.codex_reasoning,
             "claude_max_budget_usd": config.claude_max_budget_usd,
+            "council_workers": config.council_workers,
             "publish": False,
             "pr_number": 0,
             "local_review": True,
@@ -548,6 +550,28 @@ def publish_local_review(
     )
 
 
+def _completed_contract_stage(
+    store: RunStore,
+    stage: str,
+    schema_name: str,
+    contract: Callable[[dict[str, Any]], dict[str, Any]],
+) -> dict[str, Any] | None:
+    """A completed stage, or None once its payload no longer satisfies the contract.
+
+    New stages are contract-checked before they are persisted, so this only catches an
+    artifact written by an earlier version. It fails the stage rather than returning a
+    payload the pipeline cannot use, so this invocation re-runs it instead of replaying it.
+    """
+    completed = store.read_completed_stage(stage)
+    if completed is None:
+        return None
+    try:
+        return contract(validate_output(schema_name, completed))
+    except ProviderError as exc:
+        store.fail_stage(stage, str(exc))
+        return None
+
+
 def _provider_context(store: RunStore, state: dict[str, Any]) -> dict[str, Any]:
     context_dir = store.root / "context"
     return {
@@ -570,14 +594,20 @@ def _routing(
     """Resolve the council. On resume this replays the artifact instead of re-deciding."""
     requested = state["options"].get("council_members")
     deterministic = deterministic_members(changed_paths)
-    routing = store.read_completed_stage("review-routing")
     if requested:
         members = tuple(parse_member(name) for name in requested)
+        routing = store.read_completed_stage("review-routing")
         if routing is None:
             routing = empty_routing(members, "Council selected by the caller")
             store.begin_stage("review-routing", "controller")
             store.complete_stage("review-routing", routing)
         return members, frozenset(), routing
+
+    def contract(value: dict[str, Any]) -> dict[str, Any]:
+        apply_lead_routing(value, deterministic=deterministic, changed_paths=changed_paths)
+        return value
+
+    routing = _completed_contract_stage(store, "review-routing", "review_routing", contract)
     if routing is None:
         routing = runner.run(
             ProviderRequest(
@@ -592,11 +622,10 @@ def _routing(
                 schema_name="review_routing",
                 writable=False,
                 timeout=config.stage_timeout,
+                contract=contract,
                 **_provider_context(store, state),
             )
         )
-    else:
-        validate_output("review_routing", routing)
     members, focus = apply_lead_routing(
         routing, deterministic=deterministic, changed_paths=changed_paths
     )
@@ -616,13 +645,16 @@ def _run_specialists(
     reviews: dict[Member, dict[str, Any]] = {}
     pending: list[Member] = []
     for member in members:
-        completed = store.read_completed_stage(stage_name(member))
+        completed = _completed_contract_stage(
+            store,
+            stage_name(member),
+            "specialist_review",
+            lambda value, member=member: normalize_review(member, value),
+        )
         if completed is None:
             pending.append(member)
         else:
-            reviews[member] = normalize_review(
-                member, validate_output("specialist_review", completed)
-            )
+            reviews[member] = completed
     if not pending:
         return reviews
 
@@ -644,6 +676,7 @@ def _run_specialists(
                 schema_name="specialist_review",
                 writable=False,
                 timeout=config.stage_timeout,
+                contract=lambda value: normalize_review(member, value),
                 **provider_context,
             )
         )
@@ -656,7 +689,7 @@ def _run_specialists(
         for future in as_completed(futures):
             member = futures[future]
             try:
-                reviews[member] = normalize_review(member, future.result())
+                reviews[member] = future.result()
             except Exception as exc:  # noqa: BLE001 - reported per member below
                 errors[member.value] = str(exc)
     if errors:
@@ -714,7 +747,13 @@ def execute_review(store: RunStore, repo: GitRepo, config: HarnessConfig) -> dic
         "specialist-findings.json", findings_manifest(indexed)
     )
 
-    lead = store.read_completed_stage("review-consolidation")
+    def consolidation_contract(value: dict[str, Any]) -> dict[str, Any]:
+        apply_lead_verdict(value, indexed)
+        return value
+
+    lead = _completed_contract_stage(
+        store, "review-consolidation", "review_lead", consolidation_contract
+    )
     if lead is None:
         if indexed:
             lead = runner.run(
@@ -730,6 +769,7 @@ def execute_review(store: RunStore, repo: GitRepo, config: HarnessConfig) -> dic
                     schema_name="review_lead",
                     writable=False,
                     timeout=config.stage_timeout,
+                    contract=consolidation_contract,
                     **_provider_context(store, state),
                 )
             )
@@ -737,8 +777,6 @@ def execute_review(store: RunStore, repo: GitRepo, config: HarnessConfig) -> dic
             lead = empty_lead_verdict(clean_summary(members, reviews))
             store.begin_stage("review-consolidation", "controller")
             store.complete_stage("review-consolidation", lead)
-    else:
-        validate_output("review_lead", lead)
     groups = apply_lead_verdict(lead, indexed)
     verify_references(store.load())
 

@@ -95,7 +95,7 @@ def _store(git_repo: GitRepo, run_id: str, kind: str, **state_updates: object) -
         source_head=git_repo.head(),
         primary_family="claude",
         prompt="prompt",
-        options={"pr_number": 16, "publish": True},
+        options={"pr_number": 16, "publish": True, "council_workers": 1},
     )
     if state_updates:
         store.update(**state_updates)
@@ -170,6 +170,8 @@ def test_resume_dispatches_task_and_review_kinds(git_repo: GitRepo, monkeypatch,
     assert (kind, run_id, root) == ("task", task.run_id, git_repo.root)
     assert answers == {"Q001": "yes"}
     assert config.stage_timeout == 30
+    # A concurrency limit chosen for the original run survives the resume.
+    assert config.council_workers == 1
     assert config.slack_enabled is False
     assert config.slack_wait_seconds == 5
     assert task.load()["options"]["timeout"] == 30

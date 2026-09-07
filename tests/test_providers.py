@@ -249,6 +249,42 @@ def test_provider_runner_round_trips_both_families(
         assert store.load()["stages"][f"probe-{family}"]["status"] == "completed"
     assert json.loads((store.root / ".probe-codex-codex-result.json").read_text())["ok"] is True
 
+    # A contract rejection must fail the stage rather than complete it: a completed stage is
+    # replayed by every resume, so persisting an unusable payload would strand the run.
+    def reject(value: dict[str, object]) -> dict[str, object]:
+        raise ProviderError("contract says no")
+
+    rejected = ProviderRequest(
+        family="claude",
+        stage="probe-contract",
+        cwd=git_repo.root,
+        prompt="probe",
+        schema_name="doctor",
+        writable=False,
+        timeout=30,
+        contract=reject,
+    )
+    with pytest.raises(ProviderError, match="contract says no"):
+        runner.run(rejected)
+    assert store.load()["stages"]["probe-contract"]["status"] == "failed"
+    assert not (store.root / "probe-contract.json").exists()
+
+    # A contract may also normalize the payload, and the normalized value is what persists.
+    normalizing = ProviderRequest(
+        family="claude",
+        stage="probe-normalized",
+        cwd=git_repo.root,
+        prompt="probe",
+        schema_name="doctor",
+        writable=False,
+        timeout=30,
+        contract=lambda value: {**value, "message": "normalized"},
+    )
+    assert runner.run(normalizing)["message"] == "normalized"
+    assert json.loads((store.root / "probe-normalized.json").read_text())["message"] == (
+        "normalized"
+    )
+
 
 def _fake_run(stdout: str = "", returncode: int = 0, codex_output: str | None = None):
     def fake_run_command(argv, *, cwd, timeout, env, check):
