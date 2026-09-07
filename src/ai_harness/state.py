@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -69,6 +70,9 @@ class RunStore:
         self.state_path = self.root / "run.json"
         self.progress = progress
         self._stage_started: dict[str, float] = {}
+        # Council specialists run in a thread pool and share one store, so every
+        # load-modify-save below is a critical section.
+        self._lock = threading.RLock()
 
     @classmethod
     def create(
@@ -128,56 +132,60 @@ class RunStore:
         _atomic_write(self.state_path, encoded)
 
     def update(self, **values: Any) -> dict[str, Any]:
-        state = self.load()
-        state.update(values)
-        self.save(state)
-        return state
+        with self._lock:
+            state = self.load()
+            state.update(values)
+            self.save(state)
+            return state
 
     def begin_stage(self, name: str, family: str) -> None:
-        state = self.load()
-        stages = state["stages"]
-        previous = stages.get(name, {})
-        stages[name] = {
-            **previous,
-            "name": name,
-            "family": family,
-            "status": "running",
-            "started_at": utc_now(),
-            "error": None,
-        }
-        state["status"] = "running"
-        self.save(state)
-        self._stage_started[name] = time.monotonic()
+        with self._lock:
+            state = self.load()
+            stages = state["stages"]
+            previous = stages.get(name, {})
+            stages[name] = {
+                **previous,
+                "name": name,
+                "family": family,
+                "status": "running",
+                "started_at": utc_now(),
+                "error": None,
+            }
+            state["status"] = "running"
+            self.save(state)
+            self._stage_started[name] = time.monotonic()
         self.log(stage_started_message(name, family))
 
     def complete_stage(self, name: str, value: dict[str, Any]) -> Path:
         artifact = self.root / f"{name}.json"
         payload = json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n"
         _atomic_write(artifact, payload)
-        state = self.load()
-        stage = state["stages"].setdefault(name, {"name": name})
-        stage.update(
-            {
-                "status": "completed",
-                "artifact": artifact.name,
-                "sha256": sha256_bytes(payload),
-                "completed_at": utc_now(),
-                "error": None,
-            }
-        )
-        self.save(state)
-        started = self._stage_started.pop(name, None)
+        with self._lock:
+            state = self.load()
+            stage = state["stages"].setdefault(name, {"name": name})
+            stage.update(
+                {
+                    "status": "completed",
+                    "artifact": artifact.name,
+                    "sha256": sha256_bytes(payload),
+                    "completed_at": utc_now(),
+                    "error": None,
+                }
+            )
+            self.save(state)
+            started = self._stage_started.pop(name, None)
         elapsed = time.monotonic() - started if started is not None else None
         self.log(stage_completed_message(name, str(stage.get("family", "")), value, elapsed))
         return artifact
 
     def fail_stage(self, name: str, error: str) -> None:
-        state = self.load()
-        stage = state["stages"].setdefault(name, {"name": name})
-        stage.update({"status": "failed", "error": error, "failed_at": utc_now()})
-        state["status"] = "failed"
-        self.save(state)
-        started = self._stage_started.pop(name, None)
+        with self._lock:
+            state = self.load()
+            stage = state["stages"].setdefault(name, {"name": name})
+            stage.update({"status": "failed", "error": error, "failed_at": utc_now()})
+            state["status"] = "failed"
+            self.save(state)
+            started = self._stage_started.pop(name, None)
         elapsed = f" after {time.monotonic() - started:.1f}s" if started is not None else ""
         self.log(f"Failed stage: {stage_label(name)}{elapsed} — {error}")
 

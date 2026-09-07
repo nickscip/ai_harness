@@ -35,6 +35,7 @@ class HarnessConfig:
     claude_max_budget_usd: float = 8.0
     max_pr_files: int = 300
     max_pr_lines: int = 100_000
+    council_workers: int = 3
     slack_enabled: bool = False
     slack_user: str = ""
     slack_wait_seconds: int = 1_800
@@ -90,6 +91,11 @@ class HarnessConfig:
             if timeout is not None
             else int(os.getenv("AI_HARNESS_TIMEOUT", str(selected.timeout_seconds)))
         )
+        council_workers = int(os.getenv("AI_HARNESS_COUNCIL_WORKERS", "3"))
+        if not 1 <= council_workers <= 6:
+            raise HarnessError(
+                f"AI_HARNESS_COUNCIL_WORKERS must be between 1 and 6, not {council_workers}"
+            )
         return cls(
             primary_family=selected.provider,
             profile_name=selected.name,
@@ -113,6 +119,7 @@ class HarnessConfig:
             ),
             max_pr_files=int(os.getenv("AI_HARNESS_MAX_PR_FILES", "300")),
             max_pr_lines=int(os.getenv("AI_HARNESS_MAX_PR_LINES", "100000")),
+            council_workers=council_workers,
             slack_enabled=(
                 slack if slack is not None else _env_flag("AI_HARNESS_SLACK", False)
             ),

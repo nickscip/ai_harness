@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import stat
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import lru_cache
@@ -43,6 +44,10 @@ class ProviderRequest:
     timeout: int
     context_dirs: tuple[Path, ...] = ()
     git_admin_dir: Path | None = None
+    # Checks the JSON schema cannot express, applied before the stage is persisted. A
+    # schema-valid but contract-invalid reply must fail its stage: a completed stage is
+    # replayed by every resume, so persisting one would strand the run permanently.
+    contract: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
 
 def _candidate_paths(env_name: str, command: str) -> list[Path]:
@@ -284,6 +289,8 @@ class ProviderRunner:
             else:
                 value = self._run_codex(request)
             value = validate_output(request.schema_name, value)
+            if request.contract is not None:
+                value = request.contract(value)
             self.store.complete_stage(request.stage, value)
             return value
         except (CommandError, ProviderError, OSError, json.JSONDecodeError) as exc:

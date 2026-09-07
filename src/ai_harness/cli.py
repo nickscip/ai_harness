@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .config import Family, HarnessConfig, other_family
 from .context import split_prompt_and_references
+from .council import CANONICAL_ORDER
 from .doctor import deep_doctor, format_doctor, shallow_doctor, slack_doctor
 from .errors import AwaitingInput, HarnessError
 from .git import GitRepo
@@ -26,6 +27,19 @@ def _common_parser() -> argparse.ArgumentParser:
     parser.add_argument("--claude-model", default=None)
     parser.add_argument("--codex-model", default=None)
     parser.add_argument("--no-publish", action="store_true", help="Render a PR review locally")
+    parser.add_argument(
+        "--reviewer",
+        action="append",
+        default=None,
+        metavar="NAME",
+        choices=[member.value for member in CANONICAL_ORDER],
+        help="Run this council member instead of letting the review lead route (repeatable)",
+    )
+    parser.add_argument(
+        "--all-reviewers",
+        action="store_true",
+        help="Run every council member and skip review-lead routing",
+    )
     parser.add_argument(
         "--local-only",
         action="store_true",
@@ -81,6 +95,7 @@ def _config_from_state(
         apply_review=bool(options.get("apply_review", False)),
         stage_timeout=int(options.get("timeout", 900)),
         claude_max_budget_usd=float(options.get("claude_max_budget_usd", 8.0)),
+        council_workers=int(options.get("council_workers", 3)),
         slack_enabled=bool(options.get("slack_enabled", False)) if slack is None else slack,
         slack_user=str(options.get("slack_user", "")),
         slack_wait_seconds=(
@@ -236,6 +251,7 @@ def _format_config(config: HarnessConfig) -> str:
             f"- Apply PR review feedback: {'on' if config.apply_review else 'off'}",
             f"- Claude max budget: ${config.claude_max_budget_usd:.2f}",
             f"- per-agent timeout: {config.stage_timeout}s",
+            f"- parallel council specialists: {config.council_workers}",
             (
                 "Resolution order: CLI flags > AI_HARNESS_* environment > "
                 "selected profile > built-in defaults."
@@ -360,6 +376,13 @@ def _dispatch(argv: list[str]) -> int:
                     "--slack is only valid with an implementation task; "
                     "pull request reviews do not ask blocking questions"
                 )
+            if args.reviewer and args.all_reviewers:
+                raise HarnessError("--reviewer and --all-reviewers cannot be combined")
+            council = (
+                [member.value for member in CANONICAL_ORDER]
+                if args.all_reviewers
+                else args.reviewer
+            )
             if len(args.parts) < 2:
                 parser.error("/review requires a pull request number")
             try:
@@ -377,6 +400,7 @@ def _dispatch(argv: list[str]) -> int:
                 prompt=prompt,
                 references=references,
                 publish=not args.no_publish,
+                council=council,
                 progress=progress,
             )
             result = store.load()["result"]
@@ -392,6 +416,8 @@ def _dispatch(argv: list[str]) -> int:
             return 0
         if args.no_publish:
             raise HarnessError("--no-publish is only valid with /review")
+        if args.reviewer or args.all_reviewers:
+            raise HarnessError("--reviewer and --all-reviewers are only valid with /review")
         prompt, references = split_prompt_and_references(args.parts, Path.cwd())
         store = start_task(
             repo,
