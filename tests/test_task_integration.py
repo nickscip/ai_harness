@@ -467,8 +467,17 @@ def test_delivery_commits_reviews_pushes_opens_draft_pr_and_publishes(
     execute_task(store, git_repo, HarnessConfig())
 
 
+_FEEDBACK_VERIFICATION = {
+    "argv": ["git", "status", "--porcelain"],
+    "cwd": ".",
+    "timeout_seconds": 30,
+    "purpose": "Confirm the tree is inspectable after applying feedback",
+}
+
+
+@pytest.mark.parametrize("fixes_anything", [True, False])
 def test_apply_review_lets_the_primary_fix_findings_and_updates_the_pull_request(
-    git_repo: GitRepo, monkeypatch
+    git_repo: GitRepo, monkeypatch, fixes_anything: bool
 ) -> None:
     pushed: list[tuple[str, str]] = []
     finding = {
@@ -504,16 +513,19 @@ def test_apply_review_lets_the_primary_fix_findings_and_updates_the_pull_request
                     "required_changes": [],
                 }
             elif request.stage == "revised-plan":
-                value = _revised_plan()
+                value = {**_revised_plan(), "verification_commands": [_FEEDBACK_VERIFICATION]}
             elif request.stage == "review-feedback":
                 assert request.writable
                 assert request.git_admin_dir is not None
-                (request.cwd / "result.txt").write_text("implemented\nfixed\n", encoding="utf-8")
+                if fixes_anything:
+                    (request.cwd / "result.txt").write_text(
+                        "implemented\nfixed\n", encoding="utf-8"
+                    )
                 value = {
                     "summary": "Apply F001",
-                    "changed_files": ["result.txt"],
+                    "changed_files": ["result.txt"] if fixes_anything else [],
                     "verification_requested": [],
-                    "notes": ["F001 fixed."],
+                    "notes": ["F001 fixed."] if fixes_anything else ["F001 is a false positive."],
                 }
             else:
                 (request.cwd / "result.txt").write_text("implemented", encoding="utf-8")
@@ -574,14 +586,26 @@ def test_apply_review_lets_the_primary_fix_findings_and_updates_the_pull_request
 
     state = store.load()
     worktree = Path(state["result"]["worktree"])
-    feedback = state["result"]["delivery"]["feedback"]
-    assert feedback["changed_paths"] == ["result.txt"]
-    assert feedback["notes"] == ["F001 fixed."]
-    assert feedback["commit"] and feedback["commit"] != state["result"]["delivery"]["commit"]
-    # The fix lands as a second commit on the same branch, so the pull request is updated in place.
-    assert len(pushed) == 2
-    assert pushed[0] == pushed[1] == (str(worktree), state["branch"])
+    delivery = state["result"]["delivery"]
+    feedback = delivery["feedback"]
     assert git_repo.status(cwd=worktree) == []
+
+    if fixes_anything:
+        assert feedback["changed_paths"] == ["result.txt"]
+        assert feedback["notes"] == ["F001 fixed."]
+        assert feedback["commit"] and feedback["commit"] != delivery["commit"]
+        # The plan's verification commands re-run before the fix is committed.
+        ran = [record["argv"][1:] for record in feedback["commands"]]
+        assert ran == [["status", "--porcelain"]]
+        # The fix lands as a second commit on the same branch, updating the PR in place.
+        assert pushed == [(str(worktree), state["branch"])] * 2
+    else:
+        # Every finding was argued down. Nothing is committed, pushed, or verified again.
+        assert feedback["changed_paths"] == []
+        assert feedback["commit"] == ""
+        assert feedback["commands"] == []
+        assert feedback["notes"] == ["F001 is a false positive."]
+        assert pushed == [(str(worktree), state["branch"])]
 
     monkeypatch.setattr(
         GitRepo,
@@ -591,8 +615,106 @@ def test_apply_review_lets_the_primary_fix_findings_and_updates_the_pull_request
     execute_task(store, git_repo, config)
 
 
-def test_apply_review_is_off_unless_the_profile_asks_for_it() -> None:
-    assert HarnessConfig().apply_review is False
+def test_findings_are_left_on_the_pull_request_unless_the_profile_applies_them(
+    git_repo: GitRepo, monkeypatch
+) -> None:
+    """A finding alone must not trigger the feedback pass; only `apply_review` may."""
+    finding = {
+        "id": "F001",
+        "severity": "high",
+        "title": "Missing trailing newline",
+        "body": "result.txt has no trailing newline.",
+        "evidence": [
+            {
+                "path": "result.txt",
+                "line": 1,
+                "side": "RIGHT",
+                "excerpt": "implemented",
+                "rationale": "The file ends without a newline.",
+            }
+        ],
+        "recommendation": "Append a trailing newline.",
+    }
+
+    class Runner:
+        def __init__(self, config, store: RunStore):
+            self.store = store
+
+        def run(self, request):
+            self.store.begin_stage(request.stage, request.family)
+            if request.stage == "plan":
+                value = _plan()
+            elif request.stage == "plan-review":
+                value = {
+                    "verdict": "approve",
+                    "summary": "No defects.",
+                    "findings": [],
+                    "required_changes": [],
+                }
+            elif request.stage == "revised-plan":
+                value = _revised_plan()
+            else:
+                assert request.stage != "review-feedback"
+                (request.cwd / "result.txt").write_text("implemented", encoding="utf-8")
+                value = {
+                    "summary": "Implement the result file",
+                    "changed_files": ["result.txt"],
+                    "verification_requested": [],
+                    "notes": [],
+                }
+            self.store.complete_stage(request.stage, value)
+            return value
+
+    def fake_create_local_review(repo, *, config, head, prompt, **kwargs):
+        review_store = RunStore.create(
+            repo.common_git_dir,
+            run_id="20260809-000000-review-unapplied",
+            kind="review",
+            source_repo=repo.root,
+            source_head=head,
+            primary_family=config.primary_family,
+            prompt=prompt,
+            options={"local_review": True, "publish": False, "pr_number": 0},
+        )
+        review_store.begin_stage("review-final", config.primary_family)
+        review_store.complete_stage(
+            "review-final", {"summary": "One finding.", "findings": [finding]}
+        )
+        review_store.write_text_artifact("review.md", "## F001\n")
+        review_store.update(status="completed", result={"published": False, "findings": 1})
+        return review_store
+
+    monkeypatch.setattr("ai_harness.task.ProviderRunner", Runner)
+    monkeypatch.setattr("ai_harness.task.create_local_review", fake_create_local_review)
+    monkeypatch.setattr(
+        "ai_harness.task.execute_review",
+        lambda review_store, repo, config: review_store.load()["result"],
+    )
+    monkeypatch.setattr(
+        "ai_harness.task.publish_local_review",
+        lambda review_store, *, repo, name_with_owner, number: {"published": True, "url": "u"},
+    )
+    monkeypatch.setattr("ai_harness.task.repository_name", lambda repo: "owner/repo")
+    monkeypatch.setattr("ai_harness.task.open_pull_request_for_head", lambda repo, branch: None)
+    monkeypatch.setattr(
+        "ai_harness.task.create_draft_pull_request",
+        lambda repo, **kwargs: {"number": 7, "html_url": "https://example.invalid/pr/7"},
+    )
+    monkeypatch.setattr(GitRepo, "push_branch", lambda self, worktree, branch: None)
+
+    store = start_task(
+        git_repo,
+        config=HarnessConfig(apply_review=False),
+        prompt="Add result.txt",
+        references=[],
+        deliver=True,
+    )
+
+    state = store.load()
+    assert state["result"]["delivery"]["review"]["findings"] == 1
+    assert state["result"]["delivery"]["feedback"] is None
+    assert "review-feedback" not in state["stages"]
+    assert "review-feedback-delivery" not in state["stages"]
 
 
 class _PlanOnlyRunner:

@@ -982,6 +982,9 @@ def _apply_review_feedback(
                 # Every finding was argued down rather than fixed. The notes are the record.
                 delivered = {"changed_paths": [], "commit": "", "commands": []}
             else:
+                # ponytail: no review-feedback-repair stage. Failing verification aborts the run
+                # with the pull request and review already published, and resume re-runs the same
+                # failing commands. Add a repair round if that turns out to happen in practice.
                 command_results = execute_planned_commands(
                     revised["verification_commands"],
                     worktree=worktree,
