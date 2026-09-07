@@ -196,6 +196,13 @@ def test_stale_pr_head_fails_before_publication(monkeypatch, tmp_path: Path) -> 
         require_unchanged_pr_head(tmp_path, 16, "a" * 40)
 
 
+def _commit_change(git_repo: GitRepo, content: str, message: str) -> str:
+    (git_repo.root / "tracked.txt").write_text(content, encoding="utf-8")
+    run_command(["git", "add", "tracked.txt"], cwd=git_repo.root)
+    run_command(["git", "commit", "-q", "-m", message], cwd=git_repo.root)
+    return git_repo.head()
+
+
 def _completed_review(
     git_repo: GitRepo, run_id: str, *, number: int, head: str, kind: str = "review", **pr_extra
 ) -> RunStore:
@@ -246,13 +253,25 @@ def test_follow_up_review_uses_newest_completed_ancestor(git_repo: GitRepo) -> N
     assert found_state["id"] == store.run_id
     assert found_final == previous_final
     assert find_previous_review(git_repo, number=20, head=current_head) is None
-    # A different head ref, a non-review run, and an unrelated head are all skipped.
     assert find_previous_review(git_repo, number=19, head=current_head, head_ref="other") is None
+
+    # Each distractor sorts ahead of the matching run and is invalid for exactly one reason, so
+    # dropping either filter would return it instead. A real sibling commit keeps the ancestry
+    # filter honest: the run is skipped because its head is not an ancestor, not because it
+    # is missing from the repository.
+    git_repo.run(["checkout", "-q", "-b", "sibling", previous_head])
+    sibling_head = _commit_change(git_repo, "sibling\n", "sibling commit")
+    git_repo.run(["checkout", "-q", "main"])
+
     _completed_review(
-        git_repo, "20260809-000000-task-zzzzzz", number=19, head="f" * 40, kind="task"
+        git_repo, "20260809-000000-task-zzzzzz", number=19, head=previous_head, kind="task"
     )
-    _completed_review(git_repo, "20260809-000000-review-yyyyyy", number=19, head="f" * 40)
-    assert find_previous_review(git_repo, number=19, head=current_head) is not None
+    found = find_previous_review(git_repo, number=19, head=current_head)
+    assert found is not None and found[0]["id"] == store.run_id
+
+    _completed_review(git_repo, "20260809-000000-review-yyyyyy", number=19, head=sibling_head)
+    found = find_previous_review(git_repo, number=19, head=current_head)
+    assert found is not None and found[0]["id"] == store.run_id
 
     current_store = RunStore.create(
         git_repo.common_git_dir,
@@ -273,14 +292,23 @@ def test_follow_up_review_uses_newest_completed_ancestor(git_repo: GitRepo) -> N
     assert find_previous_review(git_repo, number=19, head=current_head) is None
 
 
+def test_follow_up_review_prefers_the_newest_of_two_eligible_ancestors(git_repo: GitRepo) -> None:
+    older_head = git_repo.head()
+    middle_head = _commit_change(git_repo, "middle\n", "middle")
+    current_head = _commit_change(git_repo, "current\n", "current")
+    _completed_review(git_repo, "20260809-000000-review-aaaaaa", number=19, head=older_head)
+    newer = _completed_review(
+        git_repo, "20260809-000001-review-bbbbbb", number=19, head=middle_head
+    )
+
+    found = find_previous_review(git_repo, number=19, head=current_head)
+
+    assert found is not None
+    assert found[0]["id"] == newer.run_id
+    assert found[0]["pr"]["headRefOid"] == middle_head
+
+
 # --- full review pipeline through fake providers ----------------------------------------------
-
-
-def _commit_change(git_repo: GitRepo, content: str, message: str) -> str:
-    (git_repo.root / "tracked.txt").write_text(content, encoding="utf-8")
-    run_command(["git", "add", "tracked.txt"], cwd=git_repo.root)
-    run_command(["git", "commit", "-q", "-m", message], cwd=git_repo.root)
-    return git_repo.head()
 
 
 def _metadata(base: str, head: str, number: int = 16) -> dict[str, object]:
