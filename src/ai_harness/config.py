@@ -53,6 +53,14 @@ class HarnessConfig:
         slack: bool | None = None,
         slack_wait: int | None = None,
     ) -> HarnessConfig:
+        # A stale export must not silently change which family plans and implements: that moves
+        # the provider, its credentials, and the run's cost without touching the named profile.
+        if os.getenv("AI_HARNESS_FAMILY") is not None:
+            raise HarnessError(
+                "AI_HARNESS_FAMILY is no longer supported; the primary family is the selected "
+                "profile's provider. Unset it and choose a profile with --profile or "
+                "AI_HARNESS_PROFILE."
+            )
         catalog = load_profile_catalog()
         selected = catalog.select(profile or os.getenv("AI_HARNESS_PROFILE"))
         # The primary family is the profile's provider, with no override; the critic is the other

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from ai_harness.cli import _dispatch
+from ai_harness.errors import HarnessError
 from ai_harness.git import GitRepo
 
 
@@ -65,20 +66,21 @@ def test_config_command_shows_resolved_models(monkeypatch, capsys) -> None:
 
 
 @pytest.mark.parametrize("argv", [["--family", "codex", "task"], ["config", "--family", "codex"]])
-def test_the_primary_family_cannot_be_overridden_independently_of_the_profile(
-    argv: list[str], monkeypatch, capsys
-) -> None:
+def test_the_family_flag_is_rejected_by_every_parser(argv: list[str], capsys) -> None:
     """The profile's provider is the only way to choose the primary family."""
-    monkeypatch.setenv("AI_HARNESS_FAMILY", "codex")
-
     with pytest.raises(SystemExit) as exit_info:
         _dispatch(argv)
+
     assert exit_info.value.code == 2
     assert "unrecognized arguments: --family" in capsys.readouterr().err
 
-    # The retired environment variable is inert rather than a silent back door.
-    assert _dispatch(["config", "--profile", "claude-fable"]) == 0
-    assert "primary family: claude" in capsys.readouterr().out
+
+def test_the_retired_family_variable_fails_loudly_instead_of_being_ignored(monkeypatch) -> None:
+    """Silently ignoring it would change provider, credentials, and cost with no signal."""
+    monkeypatch.setenv("AI_HARNESS_FAMILY", "codex")
+
+    with pytest.raises(HarnessError, match="AI_HARNESS_FAMILY is no longer supported"):
+        _dispatch(["config", "--profile", "claude-fable"])
 
 
 def test_claude_fable_profile_resolves_its_codex_critic_overrides(capsys) -> None:
