@@ -66,6 +66,8 @@ def test_config_command_shows_resolved_models(monkeypatch, capsys) -> None:
     assert "Claude fallback model: sonnet" in output
     assert "Codex model: codex-test-model" in output
     assert "Codex reasoning: medium" in output
+    assert "Codex fast tier: off" in output
+    assert "Apply PR review feedback: off" in output
     assert "parallel council specialists: 3" in output
 
     monkeypatch.setenv("AI_HARNESS_COUNCIL_WORKERS", "1")
@@ -75,6 +77,37 @@ def test_config_command_shows_resolved_models(monkeypatch, capsys) -> None:
     monkeypatch.setenv("AI_HARNESS_COUNCIL_WORKERS", "7")
     with pytest.raises(HarnessError, match="must be between 1 and 6, not 7"):
         _dispatch(["config"])
+
+
+@pytest.mark.parametrize("argv", [["--family", "codex", "task"], ["config", "--family", "codex"]])
+def test_the_family_flag_is_rejected_by_every_parser(argv: list[str], capsys) -> None:
+    """The profile's provider is the only way to choose the primary family."""
+    with pytest.raises(SystemExit) as exit_info:
+        _dispatch(argv)
+
+    assert exit_info.value.code == 2
+    assert "unrecognized arguments: --family" in capsys.readouterr().err
+
+
+def test_the_retired_family_variable_fails_loudly_instead_of_being_ignored(monkeypatch) -> None:
+    """Silently ignoring it would change provider, credentials, and cost with no signal."""
+    monkeypatch.setenv("AI_HARNESS_FAMILY", "codex")
+
+    with pytest.raises(HarnessError, match="AI_HARNESS_FAMILY is no longer supported"):
+        _dispatch(["config", "--profile", "claude-fable"])
+
+
+def test_claude_fable_profile_resolves_its_codex_critic_overrides(capsys) -> None:
+    assert _dispatch(["config", "--profile", "claude-fable"]) == 0
+
+    output = capsys.readouterr().out
+    assert "primary family: claude" in output
+    assert "Claude model: fable" in output
+    assert "Claude effort: high" in output
+    assert "Codex model: gpt-5.6-sol" in output
+    assert "Codex reasoning: xhigh" in output
+    assert "Codex fast tier: on" in output
+    assert "Apply PR review feedback: on" in output
 
 
 def _question(identifier: str = "Q001") -> dict[str, object]:

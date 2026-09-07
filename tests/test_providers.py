@@ -83,6 +83,19 @@ def test_codex_argv_pins_model_reasoning_sandbox_and_gitdir(tmp_path: Path) -> N
     assert "allow_login_shell=false" in argv
     assert "sandbox_workspace_write.network_access=false" in argv
     assert argv[argv.index("-m") + 1] == "gpt-5.6-terra"
+    # Only tiers a model advertises are accepted, so a non-fast run omits the flag entirely.
+    assert not any("service_tier" in item for item in argv)
+
+
+def test_codex_argv_requests_the_priority_tier_when_the_critic_is_fast(tmp_path: Path) -> None:
+    request = _request(tmp_path, family="codex", writable=False)
+    config = HarnessConfig(codex_model="gpt-5.6-sol", codex_reasoning="xhigh", codex_fast=True)
+
+    argv = build_codex_argv(request, config, Path("/bin/codex"), tmp_path / "result.json")
+
+    assert argv[argv.index("-m") + 1] == "gpt-5.6-sol"
+    assert 'model_reasoning_effort="xhigh"' in argv
+    assert 'service_tier="priority"' in argv
 
 
 def test_writable_codex_requires_git_admin_dir(tmp_path: Path) -> None:

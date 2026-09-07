@@ -226,6 +226,10 @@ def build_codex_argv(
         if request.git_admin_dir is None:
             raise ProviderError("A writable Codex run requires the linked worktree Git directory")
         argv.extend(["--add-dir", str(request.git_admin_dir)])
+    if config.codex_fast:
+        # `priority` is Codex's "fast" speed tier. Only advertised tiers are accepted, so the
+        # flag is omitted entirely rather than sent as `default` on non-fast runs.
+        argv.extend(["-c", 'service_tier="priority"'])
     argv.extend(
         [
             "--output-schema",

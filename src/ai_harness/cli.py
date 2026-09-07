@@ -22,7 +22,6 @@ def _common_parser() -> argparse.ArgumentParser:
         prog="ai-harness",
         description="Plan, adversarially review, revise, and implement with Claude and Codex.",
     )
-    parser.add_argument("--family", choices=["claude", "codex"], default=None)
     parser.add_argument("--profile", default=None, help="Named profile from council-profiles.json")
     parser.add_argument("--timeout", type=int, default=None, help="Per-stage timeout in seconds")
     parser.add_argument("--claude-model", default=None)
@@ -63,7 +62,6 @@ def _common_parser() -> argparse.ArgumentParser:
 
 def _config_from_args(args: argparse.Namespace) -> HarnessConfig:
     return HarnessConfig.from_env(
-        family=args.family,
         timeout=args.timeout,
         claude_model=args.claude_model,
         codex_model=args.codex_model,
@@ -93,6 +91,8 @@ def _config_from_state(
         claude_fallback_model=str(options.get("claude_fallback_model", "")),
         codex_model=str(options.get("codex_model", "gpt-5.6-terra")),
         codex_reasoning=str(options.get("codex_reasoning", "medium")),
+        codex_fast=bool(options.get("codex_fast", False)),
+        apply_review=bool(options.get("apply_review", False)),
         stage_timeout=int(options.get("timeout", 900)),
         claude_max_budget_usd=float(options.get("claude_max_budget_usd", 8.0)),
         council_workers=int(options.get("council_workers", 3)),
@@ -220,7 +220,8 @@ def _family_profile(config: HarnessConfig, family: Family) -> str:
         if family == "claude" and config.claude_fallback_model
         else ""
     )
-    return f"{family} (model={model}{effort}{fallback})"
+    fast = ", fast" if family == "codex" and config.codex_fast else ""
+    return f"{family} (model={model}{effort}{fast}{fallback})"
 
 
 def _model_profile_message(config: HarnessConfig) -> str:
@@ -246,6 +247,8 @@ def _format_config(config: HarnessConfig) -> str:
             f"- Claude fallback model: {config.claude_fallback_model or 'none'}",
             f"- Codex model: {config.codex_model}",
             f"- Codex reasoning: {config.codex_reasoning}",
+            f"- Codex fast tier: {'on' if config.codex_fast else 'off'}",
+            f"- Apply PR review feedback: {'on' if config.apply_review else 'off'}",
             f"- Claude max budget: ${config.claude_max_budget_usd:.2f}",
             f"- per-agent timeout: {config.stage_timeout}s",
             f"- parallel council specialists: {config.council_workers}",
@@ -279,7 +282,6 @@ def _cleanup(repo: GitRepo, run_id: str) -> int:
 def _dispatch(argv: list[str]) -> int:
     if argv and argv[0] == "config":
         parser = argparse.ArgumentParser(prog="ai-harness config")
-        parser.add_argument("--family", choices=["claude", "codex"], default=None)
         parser.add_argument("--profile", default=None)
         parser.add_argument("--timeout", type=int, default=None)
         parser.add_argument("--claude-model", default=None)
@@ -441,6 +443,15 @@ def _dispatch(argv: list[str]) -> int:
             elif review["publication"].get("idempotent"):
                 print("Review: already published for this exact implementation")
             print(f"Findings: {review['findings']}")
+            feedback = delivery.get("feedback")
+            if feedback:
+                if feedback["commit"]:
+                    print(
+                        f"Review feedback applied in {feedback['commit'][:12]}: "
+                        f"{len(feedback['changed_paths'])} file(s)"
+                    )
+                else:
+                    print("Review feedback reviewed; no code change was warranted.")
         else:
             print(f"Worktree: {result['worktree']}")
             print(f"Branch: {result['branch']}")

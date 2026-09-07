@@ -29,6 +29,8 @@ class HarnessConfig:
     claude_fallback_model: str = ""
     codex_model: str = "gpt-5.6-terra"
     codex_reasoning: str = "medium"
+    codex_fast: bool = False
+    apply_review: bool = False
     stage_timeout: int = 900
     claude_max_budget_usd: float = 8.0
     max_pr_files: int = 300
@@ -45,7 +47,6 @@ class HarnessConfig:
     def from_env(
         cls,
         *,
-        family: Family | None = None,
         timeout: int | None = None,
         claude_model: str | None = None,
         codex_model: str | None = None,
@@ -53,17 +54,31 @@ class HarnessConfig:
         slack: bool | None = None,
         slack_wait: int | None = None,
     ) -> HarnessConfig:
+        # A stale export must not silently change which family plans and implements: that moves
+        # the provider, its credentials, and the run's cost without touching the named profile.
+        if os.getenv("AI_HARNESS_FAMILY") is not None:
+            raise HarnessError(
+                "AI_HARNESS_FAMILY is no longer supported; the primary family is the selected "
+                "profile's provider. Unset it and choose a profile with --profile or "
+                "AI_HARNESS_PROFILE."
+            )
         catalog = load_profile_catalog()
         selected = catalog.select(profile or os.getenv("AI_HARNESS_PROFILE"))
-        profile_claude_model = selected.model if selected.provider == "claude" else "sonnet"
-        profile_codex_model = (
-            selected.model if selected.provider == "codex" else "gpt-5.6-terra"
+        # The primary family is the profile's provider, with no override; the critic is the other
+        # family and takes the profile's optional critic_* overrides.
+        primary_is_claude = selected.provider == "claude"
+        profile_claude_model = (
+            selected.model if primary_is_claude else (selected.critic_model or "sonnet")
         )
-        profile_claude_effort = selected.effort if selected.provider == "claude" else "medium"
-        profile_codex_effort = selected.effort if selected.provider == "codex" else "medium"
-        resolved_family = family or os.getenv("AI_HARNESS_FAMILY", selected.provider)
-        if resolved_family not in {"claude", "codex"}:
-            raise ValueError(f"Unsupported family: {resolved_family}")
+        profile_codex_model = (
+            (selected.critic_model or "gpt-5.6-terra") if primary_is_claude else selected.model
+        )
+        profile_claude_effort = (
+            selected.effort if primary_is_claude else (selected.critic_effort or "medium")
+        )
+        profile_codex_effort = (
+            (selected.critic_effort or "medium") if primary_is_claude else selected.effort
+        )
         claude_effort = os.getenv("AI_HARNESS_CLAUDE_EFFORT", profile_claude_effort)
         codex_effort = os.getenv("AI_HARNESS_CODEX_REASONING", profile_codex_effort)
         allowed_efforts = {"low", "medium", "high", "xhigh", "max"}
@@ -82,7 +97,7 @@ class HarnessConfig:
                 f"AI_HARNESS_COUNCIL_WORKERS must be between 1 and 6, not {council_workers}"
             )
         return cls(
-            primary_family=resolved_family,
+            primary_family=selected.provider,
             profile_name=selected.name,
             profile_description=selected.description,
             profiles_path=str(catalog.path),
@@ -96,6 +111,8 @@ class HarnessConfig:
             codex_model=codex_model
             or os.getenv("AI_HARNESS_CODEX_MODEL", profile_codex_model),
             codex_reasoning=codex_effort,
+            codex_fast=_env_flag("AI_HARNESS_CODEX_FAST", selected.critic_fast),
+            apply_review=_env_flag("AI_HARNESS_APPLY_REVIEW", selected.apply_review),
             stage_timeout=resolved_timeout,
             claude_max_budget_usd=float(
                 os.getenv("AI_HARNESS_CLAUDE_MAX_BUDGET_USD", "8")
