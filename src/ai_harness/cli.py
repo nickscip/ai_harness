@@ -21,7 +21,6 @@ def _common_parser() -> argparse.ArgumentParser:
         prog="ai-harness",
         description="Plan, adversarially review, revise, and implement with Claude and Codex.",
     )
-    parser.add_argument("--family", choices=["claude", "codex"], default=None)
     parser.add_argument("--profile", default=None, help="Named profile from council-profiles.json")
     parser.add_argument("--timeout", type=int, default=None, help="Per-stage timeout in seconds")
     parser.add_argument("--claude-model", default=None)
@@ -49,7 +48,6 @@ def _common_parser() -> argparse.ArgumentParser:
 
 def _config_from_args(args: argparse.Namespace) -> HarnessConfig:
     return HarnessConfig.from_env(
-        family=args.family,
         timeout=args.timeout,
         claude_model=args.claude_model,
         codex_model=args.codex_model,
@@ -268,7 +266,6 @@ def _cleanup(repo: GitRepo, run_id: str) -> int:
 def _dispatch(argv: list[str]) -> int:
     if argv and argv[0] == "config":
         parser = argparse.ArgumentParser(prog="ai-harness config")
-        parser.add_argument("--family", choices=["claude", "codex"], default=None)
         parser.add_argument("--profile", default=None)
         parser.add_argument("--timeout", type=int, default=None)
         parser.add_argument("--claude-model", default=None)

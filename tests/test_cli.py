@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from ai_harness.cli import _dispatch
 from ai_harness.git import GitRepo
 
@@ -60,6 +62,23 @@ def test_config_command_shows_resolved_models(monkeypatch, capsys) -> None:
     assert "Codex reasoning: medium" in output
     assert "Codex fast tier: off" in output
     assert "Apply PR review feedback: off" in output
+
+
+@pytest.mark.parametrize("argv", [["--family", "codex", "task"], ["config", "--family", "codex"]])
+def test_the_primary_family_cannot_be_overridden_independently_of_the_profile(
+    argv: list[str], monkeypatch, capsys
+) -> None:
+    """The profile's provider is the only way to choose the primary family."""
+    monkeypatch.setenv("AI_HARNESS_FAMILY", "codex")
+
+    with pytest.raises(SystemExit) as exit_info:
+        _dispatch(argv)
+    assert exit_info.value.code == 2
+    assert "unrecognized arguments: --family" in capsys.readouterr().err
+
+    # The retired environment variable is inert rather than a silent back door.
+    assert _dispatch(["config", "--profile", "claude-fable"]) == 0
+    assert "primary family: claude" in capsys.readouterr().out
 
 
 def test_claude_fable_profile_resolves_its_codex_critic_overrides(capsys) -> None:

@@ -70,10 +70,11 @@ ai-harness config --profile claude-opus
 ```
 
 The root [`council-profiles.json`](council-profiles.json) file is the editable source of truth for
-named profiles. Select one per run with `--profile NAME`, or set `AI_HARNESS_PROFILE`. A profile
-chooses the primary family, that family's model and effort, the timeout, and an optional Claude
-fallback model. The other family still participates as the adversary using its configured
-counterpart model.
+named profiles. Select one per run with `--profile NAME`, or set `AI_HARNESS_PROFILE`. The profile's
+`provider` is the primary family, and there is no way to override it independently: swapping which
+family plans and implements means selecting a different profile. A profile also chooses that
+family's model and effort, the timeout, and an optional Claude fallback model. The other family
+participates as the adversary using its configured counterpart model.
 
 A profile may also pin the adversarial family instead of accepting its defaults, and opt into a
 final feedback pass:
@@ -91,7 +92,6 @@ the selected profile, then built-in library defaults. The common settings are:
 | Setting | CLI flag | Environment variable | Default |
 |---|---|---|---|
 | Named profile | `--profile` | `AI_HARNESS_PROFILE` | `codex-balanced` |
-| Primary family | `--family` | `AI_HARNESS_FAMILY` | selected profile |
 | Claude model | `--claude-model` | `AI_HARNESS_CLAUDE_MODEL` | `sonnet` |
 | Codex model | `--codex-model` | `AI_HARNESS_CODEX_MODEL` | `gpt-5.6-terra` |
 | Codex reasoning | — | `AI_HARNESS_CODEX_REASONING` | `medium` |
@@ -119,7 +119,7 @@ and review publication:
 
 ```sh
 ai-harness "Add bounded retries to the upload worker and test the exhausted path"
-ai-harness --family codex --timeout 1200 "Refactor the parser without changing its API"
+ai-harness --profile codex-deep --timeout 1200 "Refactor the parser without changing its API"
 ```
 
 The default `codex-balanced` profile uses Codex `gpt-5.6-terra` with medium reasoning as the primary

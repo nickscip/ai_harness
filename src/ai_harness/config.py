@@ -46,7 +46,6 @@ class HarnessConfig:
     def from_env(
         cls,
         *,
-        family: Family | None = None,
         timeout: int | None = None,
         claude_model: str | None = None,
         codex_model: str | None = None,
@@ -56,8 +55,8 @@ class HarnessConfig:
     ) -> HarnessConfig:
         catalog = load_profile_catalog()
         selected = catalog.select(profile or os.getenv("AI_HARNESS_PROFILE"))
-        # The primary family comes from the profile's provider; the critic is the other family
-        # and takes the profile's optional critic_* overrides.
+        # The primary family is the profile's provider, with no override; the critic is the other
+        # family and takes the profile's optional critic_* overrides.
         primary_is_claude = selected.provider == "claude"
         profile_claude_model = (
             selected.model if primary_is_claude else (selected.critic_model or "sonnet")
@@ -71,9 +70,6 @@ class HarnessConfig:
         profile_codex_effort = (
             (selected.critic_effort or "medium") if primary_is_claude else selected.effort
         )
-        resolved_family = family or os.getenv("AI_HARNESS_FAMILY", selected.provider)
-        if resolved_family not in {"claude", "codex"}:
-            raise ValueError(f"Unsupported family: {resolved_family}")
         claude_effort = os.getenv("AI_HARNESS_CLAUDE_EFFORT", profile_claude_effort)
         codex_effort = os.getenv("AI_HARNESS_CODEX_REASONING", profile_codex_effort)
         allowed_efforts = {"low", "medium", "high", "xhigh", "max"}
@@ -87,7 +83,7 @@ class HarnessConfig:
             else int(os.getenv("AI_HARNESS_TIMEOUT", str(selected.timeout_seconds)))
         )
         return cls(
-            primary_family=resolved_family,
+            primary_family=selected.provider,
             profile_name=selected.name,
             profile_description=selected.description,
             profiles_path=str(catalog.path),
