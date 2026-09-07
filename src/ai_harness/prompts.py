@@ -255,19 +255,42 @@ controller runs verification. You may use allowed read-only Git commands. Do not
 access the network. Return only the structured implementation summary after edits are complete."""
 
 
-def pr_draft_prompt(
+def _review_subject(number: int, title: str, branch: str) -> str:
+    """PR reviews and local implementation reviews share one prompt set."""
+    if number > 0:
+        return f"pull request #{number}: {json.dumps(title)}"
+    return f"local branch {json.dumps(branch)}: {json.dumps(title)}"
+
+
+def specialist_prompt(
+    *,
+    contract: str,
+    charter: str,
     number: int,
     title: str,
+    branch: str,
     base: str,
     head: str,
     diff_path: Path,
     user_prompt: str,
     context: str,
     follow_up: str = "",
+    focused: bool = False,
 ) -> str:
+    focus = (
+        "\n\nThe review lead assigned the caller's review direction specifically to you. "
+        "Apply it inside your specialty without widening your charter."
+        if focused
+        else ""
+    )
     return f"""{_repository_preamble()}
 
-Review pull request #{number}: {json.dumps(title)}
+{contract}
+
+{charter}{focus}
+
+REVIEW SUBJECT
+Reviewing {_review_subject(number, title, branch)}
 Exact base commit: {base}
 Exact head commit: {head}
 Canonical three-dot diff: {diff_path}
@@ -279,71 +302,94 @@ USER REVIEW DIRECTION
 SUPPLEMENTAL CONTEXT
 {context}
 
-Perform a focused, adversarial code review. Find actionable correctness, security, data-loss,
-concurrency, compatibility, and test-coverage defects introduced by this diff. Avoid style comments
-and speculative issues. Verify each claim against the exact repository state. Every finding needs
-an actual changed diff location, exact excerpt, consequence, and concrete recommendation. Use stable
-IDs F001, F002, and so on. Do not modify files or publish anything. Return only the structured
-review."""
+Return only the structured specialist review."""
 
 
-def pr_critique_prompt(
+def lead_routing_prompt(
+    *,
+    charter: str,
     number: int,
+    title: str,
+    branch: str,
     base: str,
     head: str,
     diff_path: Path,
-    draft_path: Path,
+    changed_paths: list[str],
+    deterministic: list[str],
     user_prompt: str,
     context: str,
     follow_up: str = "",
 ) -> str:
     return f"""{_repository_preamble()}
 
-Adversarially critique the draft review for pull request #{number}.
+{charter}
+
+MODE: routing.
+
+REVIEW SUBJECT
+Routing the council for {_review_subject(number, title, branch)}
 Exact base commit: {base}
 Exact head commit: {head}
 Canonical three-dot diff: {diff_path}
 {follow_up}
-Draft review: {draft_path}
-User direction: {json.dumps(user_prompt)}
+
+REVIEWERS THE CONTROLLER ALREADY SELECTED
+{json.dumps(deterministic, indent=2)}
+
+CHANGED PATHS
+{json.dumps(changed_paths, indent=2)}
+
+REVIEW DIRECTION FROM THE CALLER
+{json.dumps(user_prompt)}
 
 SUPPLEMENTAL CONTEXT
 {context}
 
-Reproduce or falsify each draft finding from repository evidence. Remove false positives and style
-nits, correct severity and line locations, and add important defects the draft missed. Return a
-complete replacement finding set (not a commentary-only response) plus the IDs you rejected. Use
-changed diff locations only. Do not modify files or publish. Return only structured output."""
+Inspect the diff and select the council. This is source inspection only: do not run tests,
+scripts, package managers, or environment probes, and do not edit files. Return only the
+structured routing decision."""
 
 
-def pr_final_prompt(
+def lead_consolidation_prompt(
+    *,
+    charter: str,
     number: int,
+    title: str,
+    branch: str,
     base: str,
     head: str,
     diff_path: Path,
-    draft_path: Path,
-    critique_path: Path,
+    manifest_path: Path,
+    council: list[str],
     user_prompt: str,
     context: str,
     follow_up: str = "",
 ) -> str:
     return f"""{_repository_preamble()}
 
-Produce the final review for pull request #{number} after one adversarial cycle.
+{charter}
+
+MODE: consolidation.
+
+REVIEW SUBJECT
+Consolidating the council review of {_review_subject(number, title, branch)}
 Exact base commit: {base}
 Exact head commit: {head}
 Canonical three-dot diff: {diff_path}
 {follow_up}
-Draft review: {draft_path}
-Adversarial critique: {critique_path}
-User direction: {json.dumps(user_prompt)}
+
+COUNCIL THAT REVIEWED THIS CANDIDATE
+{json.dumps(council, indent=2)}
+
+FINDINGS MANIFEST
+Read {manifest_path}
+
+REVIEW DIRECTION FROM THE CALLER
+{json.dumps(user_prompt)}
 
 SUPPLEMENTAL CONTEXT
 {context}
 
-Return only findings that remain actionable and demonstrably introduced by this PR. Recheck every
-path, changed-side line, and excerpt. Incorporate valid new critique findings and discard falsified
-ones. Keep stable IDs when a draft finding survives. If no actionable findings remain, return an
-empty
-findings array and a concise clean summary. Do not modify files or publish. Return only structured
-output."""
+Verify each claim against the exact repository state before retaining it. This is source
+inspection only: do not run tests, scripts, package managers, or environment probes, and do
+not edit files. Return only the structured consolidation decision."""

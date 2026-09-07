@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from ai_harness.config import HarnessConfig
-from ai_harness.errors import HarnessError, StalePullRequest
+from ai_harness.errors import HarnessError, ProviderError, StalePullRequest
 from ai_harness.git import GitRepo
 from ai_harness.pr import (
     _line_from_blob,
@@ -22,7 +22,8 @@ from ai_harness.pr import (
     validate_pr_findings,
 )
 from ai_harness.process import CommandResult, run_command
-from ai_harness.state import RunStore
+from ai_harness.schema import validate_output
+from ai_harness.state import RunStore, list_runs
 
 
 def _finding(*, line: int, excerpt: str, identifier: str = "F001") -> dict[str, object]:
@@ -329,11 +330,50 @@ def _metadata(base: str, head: str, number: int = 16) -> dict[str, object]:
     }
 
 
+def _specialist_finding(
+    *, excerpt: str, severity: str = "high", line: int = 2
+) -> dict[str, object]:
+    return {
+        "severity": severity,
+        "confidence": 0.9,
+        "title": "Incorrect branch",
+        "body": "The changed branch returns the wrong value.",
+        "evidence": [
+            {
+                "path": "tracked.txt",
+                "line": line,
+                "side": "RIGHT",
+                "excerpt": excerpt,
+                "rationale": "This is the changed return.",
+            }
+        ],
+        "recommendation": "Return the expected value.",
+        "suggested_verification": "Assert the returned value in tests/test_tracked.py.",
+    }
+
+
+def _specialist_review(
+    reviewer: str, findings: list[dict[str, object]], **overrides: object
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "reviewer": reviewer,
+        "verdict": "comment" if findings else "pass",
+        "summary": "Reviewed the changed branch.",
+        "scope_reviewed": ["tracked.txt"],
+        "residual_risks": [],
+        "findings": findings,
+    }
+    value.update(overrides)
+    return value
+
+
 class _ReviewRunner:
-    """Fake provider: valid F001, invalid-excerpt F002; never touches the read-only worktree."""
+    """Fake council: one valid finding, one whose excerpt cannot be validated."""
 
     prompts: list[tuple[str, str]] = []
-    critique: dict[str, object] = {}
+    routing: dict[str, object] = {}
+    consolidation: dict[str, object] = {}
+    reviews: dict[str, dict[str, object]] = {}
 
     def __init__(self, config, store: RunStore):
         self.store = store
@@ -342,25 +382,58 @@ class _ReviewRunner:
         _ReviewRunner.prompts.append((request.stage, request.prompt))
         assert request.writable is False
         self.store.begin_stage(request.stage, request.family)
-        if request.stage == "review-critique":
-            value = dict(_ReviewRunner.critique)
+        if request.stage == "review-routing":
+            value = dict(_ReviewRunner.routing)
+        elif request.stage == "review-consolidation":
+            value = dict(_ReviewRunner.consolidation)
         else:
-            value = {
-                "summary": "Two findings.",
-                "findings": [
-                    _finding(line=2, excerpt="new line"),
-                    _finding(line=2, excerpt="does not match", identifier="F002"),
-                ],
-            }
+            member = request.stage.removeprefix("review-")
+            value = _ReviewRunner.reviews.get(member) or _specialist_review(member, [])
+        try:
+            value = validate_output(request.schema_name, value)
+        except ProviderError as exc:
+            self.store.fail_stage(request.stage, str(exc))
+            raise
         self.store.complete_stage(request.stage, value)
         return value
+
+
+def _default_council_responses() -> None:
+    _ReviewRunner.prompts = []
+    _ReviewRunner.routing = {
+        "specialist_requests": [
+            {
+                "reviewer": "resumability_reviewer",
+                "evidence_paths": ["tracked.txt"],
+                "rationale": "The change rewrites persisted content.",
+            }
+        ],
+        "focus_reviewers": ["correctness_reviewer"],
+        "summary": "Added the resumability reviewer.",
+    }
+    _ReviewRunner.reviews = {
+        "correctness_reviewer": _specialist_review(
+            "correctness_reviewer", [_specialist_finding(excerpt="new line")]
+        ),
+        "refactorer": _specialist_review(
+            "refactorer",
+            [_specialist_finding(excerpt="does not match", severity="medium")],
+        ),
+    }
+    _ReviewRunner.consolidation = {
+        "accepted_groups": [
+            {"source_ids": ["correctness_reviewer:1"], "rationale": "Real defect."},
+            {"source_ids": ["refactorer:1"], "rationale": "Separate structural defect."},
+        ],
+        "dismissed_groups": [],
+        "summary": "Two root causes retained.",
+    }
 
 
 @pytest.fixture
 def review_env(git_repo: GitRepo, monkeypatch):
     """Patch every GitHub touchpoint; return (base, head) with metadata served for `head`."""
-    _ReviewRunner.prompts = []
-    _ReviewRunner.critique = {"summary": "Keep both.", "findings": [], "rejected_finding_ids": []}
+    _default_council_responses()
     base = git_repo.head()
     head = _commit_change(git_repo, "original\nnew line\n", "change")
     served = {"head": head}
@@ -405,20 +478,39 @@ def test_start_review_pipeline_validates_evidence_renders_and_publishes(
     assert state["result"] == {
         "published": True,
         "review": str(store.root / "review.md"),
+        "council_report": str(store.root / "council-report.md"),
         "url": "https://example/review/1",
+        "reviewers": ["correctness_reviewer", "refactorer", "resumability_reviewer"],
         "findings": 2,
+        "dismissed": 0,
         "summary_only": 1,
     }
-    assert [stage for stage, _ in _ReviewRunner.prompts] == [
-        "review-draft",
-        "review-critique",
-        "review-final",
+    stages = [stage for stage, _ in _ReviewRunner.prompts]
+    assert stages[0] == "review-routing"
+    assert stages[-1] == "review-consolidation"
+    assert sorted(stages[1:-1]) == [
+        "review-correctness_reviewer",
+        "review-refactorer",
+        "review-resumability_reviewer",
     ]
     assert all("FOLLOW-UP REVIEW SCOPE" not in prompt for _, prompt in _ReviewRunner.prompts)
+
+    # The lead's focus assignment reaches only the reviewer it named.
+    focused = {
+        stage
+        for stage, prompt in _ReviewRunner.prompts
+        if "specifically to you" in prompt
+    }
+    assert focused == {"review-correctness_reviewer"}
+
     review = (store.root / "review.md").read_text(encoding="utf-8")
     assert "### [high] F001: Incorrect branch\n" in review
     assert "F002: Incorrect branch (summary only" in review
+    assert "Found by `correctness_reviewer:1`" in review
     assert state["review_marker"] in review
+    report = (store.root / "council-report.md").read_text(encoding="utf-8")
+    assert "`resumability_reviewer`: **pass**" in report
+    assert "sources: correctness_reviewer:1" in report
     assert [comment["path"] for comment in posted[0]["comments"]] == ["tracked.txt"]
     assert posted[0]["commit_id"] == served["head"]
     assert any("Loaded PR #16" in line for line in progress)
@@ -429,6 +521,66 @@ def test_start_review_pipeline_validates_evidence_renders_and_publishes(
     with pytest.raises(HarnessError, match="worktree is missing"):
         execute_review(store, git_repo, HarnessConfig())
     assert _ReviewRunner.prompts == []
+
+
+def test_explicit_council_skips_routing_and_gets_its_own_marker(
+    git_repo: GitRepo, review_env
+) -> None:
+    base, served, posted = review_env
+    auto = start_review(
+        git_repo, config=HarnessConfig(), number=16, prompt="Look", references=[], publish=True
+    )
+    _ReviewRunner.prompts.clear()
+    explicit = start_review(
+        git_repo,
+        config=HarnessConfig(),
+        number=16,
+        prompt="Look",
+        references=[],
+        publish=True,
+        council=["refactorer", "correctness_reviewer"],
+    )
+
+    stages = [stage for stage, _ in _ReviewRunner.prompts]
+    assert "review-routing" not in stages
+    assert sorted(stages[:-1]) == ["review-correctness_reviewer", "review-refactorer"]
+    assert explicit.load()["options"]["council_members"] == [
+        "correctness_reviewer",
+        "refactorer",
+    ]
+    # The requested council is part of the review identity, so this is not a repeat.
+    assert explicit.load()["review_marker"] != auto.load()["review_marker"]
+    assert len(posted) == 2
+
+
+def test_council_specialists_are_resumable_one_stage_at_a_time(
+    git_repo: GitRepo, review_env
+) -> None:
+    base, served, _ = review_env
+    _ReviewRunner.reviews["refactorer"] = {"reviewer": "refactorer", "verdict": "nonsense"}
+    with pytest.raises(ProviderError, match="refactorer"):
+        start_review(
+            git_repo, config=HarnessConfig(), number=16, prompt="Look", references=[], publish=True
+        )
+    run_id = next(
+        state["id"] for state in list_runs(git_repo.common_git_dir) if state["kind"] == "review"
+    )
+    store = RunStore(git_repo.common_git_dir, run_id)
+    state = store.load()
+    stages = state["stages"]
+    assert stages["review-correctness_reviewer"]["status"] == "completed"
+    assert stages["review-refactorer"]["status"] == "failed"
+    # A specialist that began after the failure must not leave the run marked running.
+    assert state["status"] == "failed"
+
+    _default_council_responses()
+    result = execute_review(store, git_repo, HarnessConfig())
+    assert result["findings"] == 2
+    # Only the failed specialist and the stages after it were re-run.
+    assert [stage for stage, _ in _ReviewRunner.prompts] == [
+        "review-refactorer",
+        "review-consolidation",
+    ]
 
 
 def test_extended_head_gets_follow_up_scope_and_respects_no_publish(
@@ -449,7 +601,8 @@ def test_extended_head_gets_follow_up_scope_and_respects_no_publish(
     assert follow_up["previous_run_id"] == first.run_id
     assert follow_up["previous_head"] == first.load()["pr"]["headRefOid"]
     assert "more" in Path(follow_up["update_diff"]).read_text(encoding="utf-8")
-    assert json.loads(Path(follow_up["previous_review"]).read_text())["summary"] == "Two findings."
+    previous = json.loads(Path(follow_up["previous_review"]).read_text())
+    assert previous["summary"] == "Two root causes retained."
     assert all("FOLLOW-UP REVIEW SCOPE" in prompt for _, prompt in _ReviewRunner.prompts)
     assert state["result"]["published"] is False
     assert state["result"]["url"] is None
@@ -458,8 +611,10 @@ def test_extended_head_gets_follow_up_scope_and_respects_no_publish(
 
 def test_review_pipeline_error_paths(git_repo: GitRepo, review_env) -> None:
     base, served, _ = review_env
-    _ReviewRunner.critique["rejected_finding_ids"] = ["F999"]
-    with pytest.raises(HarnessError, match=r"unknown finding IDs: \['F999'\]"):
+    _ReviewRunner.consolidation["accepted_groups"] = [
+        {"source_ids": ["correctness_reviewer:1"], "rationale": "Real defect."}
+    ]
+    with pytest.raises(ProviderError, match=r"omitted findings: \['refactorer:1'\]"):
         start_review(
             git_repo, config=HarnessConfig(), number=16, prompt="Look", references=[], publish=True
         )
@@ -519,6 +674,8 @@ def test_local_review_publishes_through_publish_local_review(
     assert result["published"] is False
     assert result["findings"] == 2
     assert posted == []
+    # The local review is not described to the council as pull request zero.
+    assert all("#0" not in prompt for _, prompt in _ReviewRunner.prompts)
 
     publication = publish_local_review(
         store, repo=git_repo, name_with_owner="owner/repo", number=16
@@ -544,3 +701,84 @@ def test_local_review_publishes_through_publish_local_review(
         publish_local_review(
             follow_up_store, repo=git_repo, name_with_owner="owner/repo", number=16
         )
+
+
+def test_clean_council_skips_consolidation_and_still_reports_residual_risk(
+    git_repo: GitRepo, review_env
+) -> None:
+    base, served, posted = review_env
+    _ReviewRunner.routing = {
+        "specialist_requests": [],
+        "focus_reviewers": [],
+        "summary": "The floor is enough.",
+    }
+    _ReviewRunner.reviews = {
+        "refactorer": _specialist_review(
+            "refactorer",
+            [],
+            verdict="abstain",
+            residual_risks=["The rename is untested."],
+        )
+    }
+    store = start_review(
+        git_repo, config=HarnessConfig(), number=16, prompt="Look", references=[], publish=True
+    )
+
+    stages = [stage for stage, _ in _ReviewRunner.prompts]
+    assert "review-consolidation" not in stages
+    assert store.load()["stages"]["review-consolidation"]["family"] == "controller"
+    assert store.load()["result"]["findings"] == 0
+    review = (store.root / "review.md").read_text(encoding="utf-8")
+    assert review.startswith("No actionable findings.")
+    assert "refactorer: The rename is untested." in review
+    assert posted[0]["comments"] == []
+
+
+def test_a_fully_completed_council_replays_its_artifacts_without_a_model(
+    git_repo: GitRepo, review_env
+) -> None:
+    base, served, posted = review_env
+    store = create_local_review(
+        git_repo,
+        config=HarnessConfig(),
+        base=base,
+        head=served["head"],
+        branch="feature",
+        title="Local change",
+        prompt="Review the implementation",
+        references=[],
+    )
+    store.begin_stage("review-routing", "claude")
+    store.complete_stage(
+        "review-routing",
+        {"specialist_requests": [], "focus_reviewers": [], "summary": "Floor only."},
+    )
+    for member, finding in (
+        ("correctness_reviewer", [_specialist_finding(excerpt="new line")]),
+        ("refactorer", []),
+    ):
+        store.begin_stage(f"review-{member}", "claude")
+        store.complete_stage(f"review-{member}", _specialist_review(member, finding))
+    store.begin_stage("review-consolidation", "claude")
+    store.complete_stage(
+        "review-consolidation",
+        {
+            "accepted_groups": [
+                {"source_ids": ["correctness_reviewer:1"], "rationale": "Real defect."}
+            ],
+            "dismissed_groups": [],
+            "summary": "One root cause.",
+        },
+    )
+    store.begin_stage("review-final", "controller")
+    store.complete_stage(
+        "review-final",
+        {"summary": "One root cause.", "findings": [_finding(line=2, excerpt="new line")]},
+    )
+    _ReviewRunner.prompts.clear()
+
+    result = execute_review(store, git_repo, HarnessConfig())
+
+    assert _ReviewRunner.prompts == []
+    assert result["findings"] == 1
+    assert result["reviewers"] == ["correctness_reviewer", "refactorer"]

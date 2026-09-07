@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "specialist_requests": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "reviewer": {
+            "type": "string",
+            "enum": [
+              "security_reviewer",
+              "performance_expert",
+              "resumability_reviewer",
+              "contract_reviewer"
+            ]
+          },
+          "evidence_paths": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {"type": "string", "minLength": 1, "maxLength": 500}
+          },
+          "rationale": {"type": "string", "minLength": 1, "maxLength": 1000}
+        },
+        "required": ["reviewer", "evidence_paths", "rationale"]
+      }
+    },
+    "focus_reviewers": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "string",
+        "enum": [
+          "correctness_reviewer",
+          "refactorer",
+          "security_reviewer",
+          "performance_expert",
+          "resumability_reviewer",
+          "contract_reviewer"
+        ]
+      }
+    },
+    "summary": {"type": "string", "minLength": 1, "maxLength": 1000}
+  },
+  "required": ["specialist_requests", "focus_reviewers", "summary"]
+}

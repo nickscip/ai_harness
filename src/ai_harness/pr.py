@@ -4,17 +4,37 @@ import hashlib
 import json
 import re
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import HarnessConfig, harness_worktree_path, other_family
+from .config import HarnessConfig, harness_worktree_path
 from .context import context_prompt, copy_references, verify_references
-from .errors import HarnessError, StalePullRequest
+from .council import (
+    Member,
+    aggregate_reviews,
+    apply_lead_routing,
+    apply_lead_verdict,
+    clean_summary,
+    deterministic_members,
+    empty_lead_verdict,
+    empty_routing,
+    findings_manifest,
+    index_findings,
+    member_family,
+    normalize_review,
+    parse_member,
+    persona,
+    render_council_report,
+    stage_name,
+    synthesize_final,
+)
+from .errors import HarnessError, ProviderError, StalePullRequest
 from .git import GitRepo
 from .github import post_review, pull_request, repository_name, review_marker_exists
 from .progress import ProgressCallback
-from .prompts import pr_critique_prompt, pr_draft_prompt, pr_final_prompt
+from .prompts import lead_consolidation_prompt, lead_routing_prompt, specialist_prompt
 from .providers import ProviderRequest, ProviderRunner
 from .schema import require_unique_ids, validate_output
 from .state import RunStore, list_runs, new_run_id
@@ -192,6 +212,7 @@ def _review_key(
     head: str,
     prompt: str,
     context: list[dict[str, Any]],
+    council: list[str] | None,
 ) -> str:
     material = json.dumps(
         {
@@ -200,6 +221,7 @@ def _review_key(
             "head": head,
             "prompt": prompt,
             "context": [item["sha256"] for item in context],
+            "council": council or "auto",
         },
         sort_keys=True,
     ).encode()
@@ -306,8 +328,10 @@ def start_review(
     prompt: str,
     references: Sequence[Path],
     publish: bool,
+    council: Sequence[str] | None = None,
     progress: ProgressCallback | None = None,
 ) -> RunStore:
+    selection = sorted({parse_member(name).value for name in council}) if council else None
     if progress is not None:
         progress(f"Loading pull request #{number} with gh")
     metadata = pull_request(repo.root, number)
@@ -351,6 +375,7 @@ def start_review(
             "claude_max_budget_usd": config.claude_max_budget_usd,
             "publish": publish,
             "pr_number": number,
+            "council_members": selection,
         },
         progress=progress,
     )
@@ -383,7 +408,7 @@ def start_review(
         }
     name = repository_name(repo.root)
     state = store.load()
-    key = _review_key(name, number, head, prompt, state["context"])
+    key = _review_key(name, number, head, prompt, state["context"], selection)
     state.update(
         {
             "worktree": str(worktree),
@@ -479,7 +504,7 @@ def create_local_review(
             "update_diff": str(update_diff_path),
         }
     state = store.load()
-    key = _review_key(str(repo.root), 0, head, prompt, state["context"])
+    key = _review_key(str(repo.root), 0, head, prompt, state["context"], None)
     state.update(
         {
             "worktree": str(worktree),
@@ -523,6 +548,126 @@ def publish_local_review(
     )
 
 
+def _provider_context(store: RunStore, state: dict[str, Any]) -> dict[str, Any]:
+    context_dir = store.root / "context"
+    return {
+        "cwd": Path(state["worktree"]),
+        "context_dirs": tuple(
+            path for path in (context_dir, store.root) if path.is_dir()
+        ),
+    }
+
+
+def _routing(
+    store: RunStore,
+    runner: ProviderRunner,
+    config: HarnessConfig,
+    *,
+    state: dict[str, Any],
+    changed_paths: set[str],
+    request: dict[str, Any],
+) -> tuple[tuple[Member, ...], frozenset[Member], dict[str, Any]]:
+    """Resolve the council. On resume this replays the artifact instead of re-deciding."""
+    requested = state["options"].get("council_members")
+    deterministic = deterministic_members(changed_paths)
+    routing = store.read_completed_stage("review-routing")
+    if requested:
+        members = tuple(parse_member(name) for name in requested)
+        if routing is None:
+            routing = empty_routing(members, "Council selected by the caller")
+            store.begin_stage("review-routing", "controller")
+            store.complete_stage("review-routing", routing)
+        return members, frozenset(), routing
+    if routing is None:
+        routing = runner.run(
+            ProviderRequest(
+                family=state["primary_family"],
+                stage="review-routing",
+                prompt=lead_routing_prompt(
+                    charter=persona("review_lead"),
+                    changed_paths=sorted(changed_paths),
+                    deterministic=[member.value for member in deterministic],
+                    **request,
+                ),
+                schema_name="review_routing",
+                writable=False,
+                timeout=config.stage_timeout,
+                **_provider_context(store, state),
+            )
+        )
+    else:
+        validate_output("review_routing", routing)
+    members, focus = apply_lead_routing(
+        routing, deterministic=deterministic, changed_paths=changed_paths
+    )
+    return members, focus, routing
+
+
+def _run_specialists(
+    store: RunStore,
+    runner: ProviderRunner,
+    config: HarnessConfig,
+    *,
+    state: dict[str, Any],
+    members: tuple[Member, ...],
+    focus: frozenset[Member],
+    request: dict[str, Any],
+) -> dict[Member, dict[str, Any]]:
+    reviews: dict[Member, dict[str, Any]] = {}
+    pending: list[Member] = []
+    for member in members:
+        completed = store.read_completed_stage(stage_name(member))
+        if completed is None:
+            pending.append(member)
+        else:
+            reviews[member] = normalize_review(
+                member, validate_output("specialist_review", completed)
+            )
+    if not pending:
+        return reviews
+
+    primary = state["primary_family"]
+    contract = persona("reviewer-common")
+    provider_context = _provider_context(store, state)
+
+    def invoke(member: Member) -> dict[str, Any]:
+        return runner.run(
+            ProviderRequest(
+                family=member_family(member, primary),
+                stage=stage_name(member),
+                prompt=specialist_prompt(
+                    contract=contract,
+                    charter=persona(member.value),
+                    focused=member in focus,
+                    **request,
+                ),
+                schema_name="specialist_review",
+                writable=False,
+                timeout=config.stage_timeout,
+                **provider_context,
+            )
+        )
+
+    errors: dict[str, str] = {}
+    workers = min(config.council_workers, len(pending))
+    store.log(f"Running {len(pending)} council specialist(s) with {workers} worker(s)")
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(invoke, member): member for member in pending}
+        for future in as_completed(futures):
+            member = futures[future]
+            try:
+                reviews[member] = normalize_review(member, future.result())
+            except Exception as exc:  # noqa: BLE001 - reported per member below
+                errors[member.value] = str(exc)
+    if errors:
+        # Specialists that finished have already persisted their stage, so a resume
+        # re-runs only the failures.
+        store.update(status="failed")
+        detail = "; ".join(f"{name}: {message}" for name, message in sorted(errors.items()))
+        raise ProviderError(f"Council specialists failed — {detail}")
+    return reviews
+
+
 def execute_review(store: RunStore, repo: GitRepo, config: HarnessConfig) -> dict[str, Any]:
     state = store.load()
     number = int(state["options"]["pr_number"])
@@ -538,104 +683,89 @@ def execute_review(store: RunStore, repo: GitRepo, config: HarnessConfig) -> dic
         return state.get("result", {})
     diff_path = Path(state["diff"])
     diff = diff_path.read_text(encoding="utf-8")
+    index = parse_diff_index(diff)
+    changed_paths = set(index.changed)
     runner = ProviderRunner(config, store)
-    primary = state["primary_family"]
-    critic = other_family(primary)
-    context = context_prompt(state)
-    context_dir = store.root / "context"
-    context_dirs = tuple(path for path in (context_dir, store.root) if path.is_dir())
-    follow_up = _follow_up_prompt(state)
+    request = {
+        "number": number,
+        "title": str(metadata["title"]),
+        "branch": str(metadata.get("headRefName") or ""),
+        "base": base,
+        "head": head,
+        "diff_path": diff_path,
+        "user_prompt": state["prompt"],
+        "context": context_prompt(state),
+        "follow_up": _follow_up_prompt(state),
+    }
 
-    draft = store.read_completed_stage("review-draft")
-    if draft is None:
-        draft = runner.run(
-            ProviderRequest(
-                family=primary,
-                stage="review-draft",
-                cwd=worktree,
-                prompt=pr_draft_prompt(
-                    number,
-                    str(metadata["title"]),
-                    base,
-                    head,
-                    diff_path,
-                    state["prompt"],
-                    context,
-                    follow_up,
-                ),
-                schema_name="pr_review",
-                writable=False,
-                timeout=config.stage_timeout,
-                context_dirs=context_dirs,
-            )
-        )
-    else:
-        validate_output("pr_review", draft)
-    require_unique_ids(draft)
+    members, focus, routing = _routing(
+        store, runner, config, state=state, changed_paths=changed_paths, request=request
+    )
     verify_references(store.load())
 
-    critique = store.read_completed_stage("review-critique")
-    if critique is None:
-        critique = runner.run(
-            ProviderRequest(
-                family=critic,
-                stage="review-critique",
-                cwd=worktree,
-                prompt=pr_critique_prompt(
-                    number,
-                    base,
-                    head,
-                    diff_path,
-                    store.root / "review-draft.json",
-                    state["prompt"],
-                    context,
-                    follow_up,
-                ),
-                schema_name="pr_critique",
-                writable=False,
-                timeout=config.stage_timeout,
-                context_dirs=context_dirs,
+    reviews = _run_specialists(
+        store, runner, config, state=state, members=members, focus=focus, request=request
+    )
+    aggregate_reviews(members, reviews)
+    verify_references(store.load())
+
+    indexed = index_findings(members, reviews)
+    manifest_path = store.write_text_artifact(
+        "specialist-findings.json", findings_manifest(indexed)
+    )
+
+    lead = store.read_completed_stage("review-consolidation")
+    if lead is None:
+        if indexed:
+            lead = runner.run(
+                ProviderRequest(
+                    family=state["primary_family"],
+                    stage="review-consolidation",
+                    prompt=lead_consolidation_prompt(
+                        charter=persona("review_lead"),
+                        manifest_path=manifest_path,
+                        council=[member.value for member in members],
+                        **request,
+                    ),
+                    schema_name="review_lead",
+                    writable=False,
+                    timeout=config.stage_timeout,
+                    **_provider_context(store, state),
+                )
             )
-        )
+        else:
+            lead = empty_lead_verdict(clean_summary(members, reviews))
+            store.begin_stage("review-consolidation", "controller")
+            store.complete_stage("review-consolidation", lead)
     else:
-        validate_output("pr_critique", critique)
-    require_unique_ids(critique)
-    draft_ids = {item["id"] for item in draft["findings"]}
-    unknown_rejections = set(critique["rejected_finding_ids"]) - draft_ids
-    if unknown_rejections:
-        raise HarnessError(f"Critique rejected unknown finding IDs: {sorted(unknown_rejections)}")
+        validate_output("review_lead", lead)
+    groups = apply_lead_verdict(lead, indexed)
     verify_references(store.load())
 
     final = store.read_completed_stage("review-final")
     if final is None:
-        final = runner.run(
-            ProviderRequest(
-                family=primary,
-                stage="review-final",
-                cwd=worktree,
-                prompt=pr_final_prompt(
-                    number,
-                    base,
-                    head,
-                    diff_path,
-                    store.root / "review-draft.json",
-                    store.root / "review-critique.json",
-                    state["prompt"],
-                    context,
-                    follow_up,
-                ),
-                schema_name="pr_review",
-                writable=False,
-                timeout=config.stage_timeout,
-                context_dirs=context_dirs,
-            )
-        )
+        final = validate_output("pr_review", synthesize_final(groups, summary=lead["summary"]))
+        store.begin_stage("review-final", "controller")
+        store.complete_stage("review-final", final)
     else:
         validate_output("pr_review", final)
     require_unique_ids(final)
-    verify_references(store.load())
+    store.write_text_artifact(
+        "council-report.md",
+        render_council_report(
+            title=request["title"],
+            base=base,
+            head=head,
+            expected=members,
+            reviews=reviews,
+            routing=routing,
+            deterministic=deterministic_members(changed_paths),
+            lead=lead,
+            groups=groups,
+            indexed=indexed,
+        ),
+    )
 
-    index = parse_diff_index(diff)
     inline, summary_only = validate_pr_findings(
         final, index=index, repo=repo, base=base, head=head
     )
@@ -685,13 +815,17 @@ def execute_review(store: RunStore, repo: GitRepo, config: HarnessConfig) -> dic
     final_state["result"] = {
         "published": publication["published"],
         "review": str(store.root / "review.md"),
+        "council_report": str(store.root / "council-report.md"),
         "url": publication.get("url"),
+        "reviewers": [member.value for member in members],
         "findings": len(final["findings"]),
+        "dismissed": len(lead["dismissed_groups"]),
         "summary_only": len(summary_only),
     }
     store.save(final_state)
     store.log(
-        f"Review workflow complete with {len(final['findings'])} finding(s); "
+        f"Review council complete with {len(final['findings'])} finding(s) from "
+        f"{len(members)} specialist(s), {len(lead['dismissed_groups'])} dismissed; "
         f"artifact {store.root / 'review.md'}"
     )
     return final_state["result"]

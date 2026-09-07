@@ -5,6 +5,8 @@ import time
 from collections.abc import Callable
 from typing import Any, TextIO
 
+from .council import MEMBER_VALUES
+
 ProgressCallback = Callable[[str], None]
 
 
@@ -39,12 +41,18 @@ _STAGE_LABELS = {
     "delivery-push": "branch push",
     "delivery-pr": "draft pull request creation",
     "delivery-review-publication": "implementation review publication",
-    "review-draft": "draft code review",
-    "review-critique": "adversarial review critique",
-    "review-final": "final code review",
+    "review-routing": "review council routing",
+    "review-consolidation": "review council consolidation",
+    "review-final": "consolidated council review",
     "evidence-validation": "review evidence validation",
     "publication": "GitHub review publication",
 }
+
+
+def specialist_stage_member(name: str) -> str | None:
+    """The council member behind a `review-<member>` stage, or None."""
+    member = name.removeprefix("review-")
+    return member if member != name and member in MEMBER_VALUES else None
 
 
 def stage_label(name: str) -> str:
@@ -52,6 +60,10 @@ def stage_label(name: str) -> str:
         return "repository-grounded plan after human input"
     if name.startswith("clarify-r"):
         return "answer to a human follow-up question"
+    member = specialist_stage_member(name)
+    if member is not None:
+        stem = member.removesuffix("_reviewer").removesuffix("_expert")
+        return f"{stem.replace('_', ' ')} review"
     return _STAGE_LABELS.get(name, name.replace("-", " "))
 
 
@@ -76,14 +88,23 @@ def _stage_summary(name: str, value: dict[str, Any]) -> str:
         changed = value.get("changed_files")
         if isinstance(changed, list):
             return f"{len(changed)} reported changed file(s)"
-    if name in {"review-draft", "review-final"}:
+    if specialist_stage_member(name) is not None:
+        findings = value.get("findings")
+        count = len(findings) if isinstance(findings, list) else 0
+        return f"{value.get('verdict', 'completed')}, {count} finding(s)"
+    if name == "review-final":
         findings = value.get("findings")
         if isinstance(findings, list):
             return f"{len(findings)} finding(s)"
-    if name == "review-critique":
-        findings = value.get("findings")
-        if isinstance(findings, list):
-            return f"{len(findings)} proposed finding(s)"
+    if name == "review-routing":
+        requests = value.get("specialist_requests")
+        count = len(requests) if isinstance(requests, list) else 0
+        return f"{count} specialist(s) requested"
+    if name == "review-consolidation":
+        accepted = value.get("accepted_groups")
+        dismissed = value.get("dismissed_groups")
+        if isinstance(accepted, list) and isinstance(dismissed, list):
+            return f"{len(accepted)} retained, {len(dismissed)} dismissed"
     if name == "implementation-capture":
         changed = value.get("changed_paths")
         if isinstance(changed, list):

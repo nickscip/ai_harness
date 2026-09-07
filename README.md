@@ -10,7 +10,7 @@ For implementation tasks it:
 3. returns the review to the primary family for a disposition-complete revision;
 4. implements the revised plan in a persistent linked worktree;
 5. runs the revised plan's verification commands itself;
-6. commits the verified diff and runs a cross-family adversarial implementation review locally;
+6. commits the verified diff and convenes the review council on it locally;
 7. pushes the harness branch and opens a draft pull request; and
 8. publishes the already-validated implementation review on that exact PR head.
 
@@ -18,9 +18,11 @@ That entire path is one workflow started by one command. A genuinely blocking pl
 the only intentional human pause; answering it resumes the same run at the exact stopped stage.
 With `--slack` that pause becomes a direct-message conversation the run continues from on its own.
 
-For pull requests it creates a detached worktree at the exact PR head, reviews the exact three-dot
-diff, has the other family critique the draft, and asks the primary family for the final review. By
-default it publishes one GitHub `COMMENT` review with validated inline locations plus a summary.
+For pull requests it convenes a **review council**. It creates a detached worktree at the exact PR
+head, reviews the exact three-dot diff, asks a review lead which specialties the diff actually
+needs, runs those specialists in parallel against separate charters, and asks the lead to group and
+filter what they found. By default it publishes one GitHub `COMMENT` review with validated inline
+locations plus a summary.
 
 ## Install
 
@@ -86,6 +88,9 @@ the selected profile, then built-in library defaults. The common settings are:
 | Codex model | `--codex-model` | `AI_HARNESS_CODEX_MODEL` | `gpt-5.6-terra` |
 | Codex reasoning | — | `AI_HARNESS_CODEX_REASONING` | `medium` |
 | Per-agent timeout | `--timeout` | `AI_HARNESS_TIMEOUT` | selected profile |
+| Parallel council specialists | — | `AI_HARNESS_COUNCIL_WORKERS` | `3` |
+| Explicit council member | `--reviewer` | — | review lead routes |
+| Every council member | `--all-reviewers` | — | review lead routes |
 | Ask planning questions on Slack | `--slack` | `AI_HARNESS_SLACK` | off |
 | Slack user to ask | — | `AI_HARNESS_SLACK_USER` | none |
 | Total Slack wait per question set | `--slack-wait` | `AI_HARNESS_SLACK_WAIT` | `1800` |
@@ -144,8 +149,9 @@ worktree-setup:
 The harness passes `ENV_SOURCE=<caller-checkout>/.env` and runs the target under the configured
 per-stage timeout. It never evaluates Make syntax while checking for the opt-in marker.
 
-The branch is pushed, its draft PR URL is printed, and the cross-family implementation review is
-published against the exact commit. To stop after verified implementation and leave the changes
+The branch is pushed, its draft PR URL is printed, and the council's implementation review is
+published against the exact commit. It is the same council described under
+[Pull request usage](#pull-request-usage), on the local branch diff instead of a PR. To stop after verified implementation and leave the changes
 uncommitted locally, opt out explicitly:
 
 ```sh
@@ -165,11 +171,69 @@ Publishing is the default. To render and validate the final review locally:
 ai-harness --no-publish /review 16 "Look for latent correctness bugs"
 ```
 
+### The review council
+
+Six specialists share one shared review contract and one output schema, and each has its own
+charter:
+
+| Member | Owns |
+|---|---|
+| `correctness_reviewer` | the premise of the change, root cause versus symptom, test integrity |
+| `refactorer` | structure, duplication, YAGNI, misleading abstractions, changed prose |
+| `security_reviewer` | secrets, credential and `PATH` boundaries, sandbox arguments, injection |
+| `performance_expert` | async and threaded paths, deadlines, fan-out, measured budgets |
+| `resumability_reviewer` | resume keys, idempotency, atomic writes, locks, recovery, cleanup |
+| `contract_reviewer` | schemas, APIs, migrations, config, and the tables that document them |
+
+`correctness_reviewer` and `refactorer` always run and cannot be removed. One narrow deterministic
+trigger adds `security_reviewer` when the diff touches `.github/workflows/` or a path naming a
+secret, credential, token, or auth. Everything else is decided by the **review lead**, which reads
+the diff and the changed-path list and may request at most three further specialists, each citing
+paths that are actually in the diff. It can add members; it can never remove one.
+
+Specialists run in parallel — `AI_HARNESS_COUNCIL_WORKERS=1` makes them sequential — with families
+alternating across the roster, so every council contains both Claude and Codex. Each returns at
+most five findings, each with a severity, a confidence, an exact changed-line location, and a
+verification that would falsify it. A specialty that does not apply abstains rather than reaching
+for something to say.
+
+The lead then consolidates. It receives the findings as a manifest of untrusted claims identified
+as `<reviewer>:<position>`, and must dispose of every one exactly once — into an accepted group or
+a dismissed group with one of `trivial`, `speculative`, `yagni`, `unsupported`, or `out_of_scope`.
+The controller rejects a duplicated, invented, or omitted claim, refuses a group whose strongest
+member is only `low` severity, and selects each retained group's severity, location, and
+verification from its strongest source. The lead groups and explains; it cannot rewrite the
+evidence. Published findings are numbered `F001` onward by the controller, not by a model.
+
+To skip routing and run a specific council:
+
+```sh
+ai-harness /review 16 --reviewer security_reviewer --reviewer resumability_reviewer
+ai-harness /review 16 --all-reviewers
+```
+
+Explicit selection is a full override, not an addition: it skips the review lead's routing pass and
+runs exactly the members named, so `--reviewer performance_expert` alone runs a one-member council
+with no correctness reviewer. The always-on floor governs automatic routing.
+
+The requested council is part of the review identity, so an explicitly selected council publishes
+separately from an automatically routed one at the same head.
+
+### Publication
+
 Only open PRs under the configured size limits are accepted. Fork heads are fetched through
 `refs/pull/<number>/head`. Immediately before publication, the controller rechecks the PR head. It
 always sends a non-empty body (`No actionable findings.` for a clean review), uses `COMMENT` rather
 than approve/request-changes, and retries a GitHub 422 once as summary-only. An invisible,
-provider-neutral marker makes resume and repeated identical reviews idempotent.
+provider-neutral marker makes resume and repeated identical reviews idempotent. Mentions in
+model-authored text are neutralized so a quoted `@team` cannot notify anyone.
+
+Every finding's cited line is re-read from the exact commit and its excerpt compared byte for byte.
+A finding whose evidence does not survive that check is published as a summary note without an
+inline location rather than attached to the wrong line.
+
+Dismissed findings never reach the pull request. They, along with every specialist's verdict and
+residual risks, are written to `council-report.md` beside the run's other artifacts.
 
 When a PR head advances after a completed review, the next review automatically uses the newest
 reviewed ancestor, its final findings, and the intervening commit delta as its primary scope. This
@@ -185,7 +249,9 @@ State and artifacts are written atomically under the target repository's common 
 ```
 
 Each completed stage has a checksum. Commit, review, push, PR creation, and publication are also
-separate resumable controller stages, even though they form one user-facing workflow. A timeout,
+separate resumable controller stages, even though they form one user-facing workflow. Each council
+specialist is its own stage too, so a resume re-runs only the specialist that failed and replays the
+routing decision rather than making it again. A timeout,
 malformed model response, failed verification, GitHub failure, or stale PR head stops the run
 without discarding completed work:
 

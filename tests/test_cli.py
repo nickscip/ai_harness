@@ -66,6 +66,15 @@ def test_config_command_shows_resolved_models(monkeypatch, capsys) -> None:
     assert "Claude fallback model: sonnet" in output
     assert "Codex model: codex-test-model" in output
     assert "Codex reasoning: medium" in output
+    assert "parallel council specialists: 3" in output
+
+    monkeypatch.setenv("AI_HARNESS_COUNCIL_WORKERS", "1")
+    assert _dispatch(["config"]) == 0
+    assert "parallel council specialists: 1" in capsys.readouterr().out
+
+    monkeypatch.setenv("AI_HARNESS_COUNCIL_WORKERS", "7")
+    with pytest.raises(HarnessError, match="must be between 1 and 6, not 7"):
+        _dispatch(["config"])
 
 
 def _question(identifier: str = "Q001") -> dict[str, object]:
@@ -100,8 +109,18 @@ def test_status_lists_all_runs_and_dumps_one(git_repo: GitRepo, monkeypatch, cap
 
     _store(git_repo, "20260906-000001-task-aaaaaa", "task")
     review = _store(git_repo, "20260906-000002-review-bbbbbb", "review")
-    review.begin_stage("review-draft", "claude")
-    review.complete_stage("review-draft", {"summary": "x", "findings": []})
+    review.begin_stage("review-correctness_reviewer", "claude")
+    review.complete_stage(
+        "review-correctness_reviewer",
+        {
+            "reviewer": "correctness_reviewer",
+            "verdict": "pass",
+            "summary": "x",
+            "scope_reviewed": [],
+            "residual_risks": [],
+            "findings": [],
+        },
+    )
 
     assert _dispatch(["status"]) == 0
     lines = capsys.readouterr().out.splitlines()
@@ -272,8 +291,12 @@ def test_review_command_reports_publication_outcome(git_repo: GitRepo, monkeypat
         def load(self):
             return {"result": results.pop(0)}
 
-    def fake_start_review(repo, *, config, number, prompt, references, publish, progress):
-        calls.append({"number": number, "prompt": prompt, "publish": publish})
+    def fake_start_review(
+        repo, *, config, number, prompt, references, publish, council, progress
+    ):
+        calls.append(
+            {"number": number, "prompt": prompt, "publish": publish, "council": council}
+        )
         return FakeStore()
 
     monkeypatch.setattr("ai_harness.cli.start_review", fake_start_review)
@@ -287,6 +310,7 @@ def test_review_command_reports_publication_outcome(git_repo: GitRepo, monkeypat
         "number": 16,
         "prompt": "Review adversarially for bugs before they happen.",
         "publish": True,
+        "council": None,
     }
 
     results.append({"review": "/r/review.md", "url": None, "published": True})
@@ -298,6 +322,30 @@ def test_review_command_reports_publication_outcome(git_repo: GitRepo, monkeypat
     assert _dispatch(["--no-publish", "/review", "16"]) == 0
     assert "Not published (--no-publish)." in capsys.readouterr().out
     assert calls[-1]["publish"] is False
+
+    results.append({"review": "/r/review.md", "url": None, "published": False})
+    assert _dispatch(["--no-publish", "--all-reviewers", "/review", "16"]) == 0
+    capsys.readouterr()
+    assert calls[-1]["council"] == [
+        "correctness_reviewer",
+        "refactorer",
+        "security_reviewer",
+        "performance_expert",
+        "resumability_reviewer",
+        "contract_reviewer",
+    ]
+
+    results.append({"review": "/r/review.md", "url": None, "published": False})
+    assert _dispatch(["--no-publish", "--reviewer", "security_reviewer", "/review", "16"]) == 0
+    capsys.readouterr()
+    assert calls[-1]["council"] == ["security_reviewer"]
+
+    with pytest.raises(HarnessError, match="cannot be combined"):
+        _dispatch(["--all-reviewers", "--reviewer", "refactorer", "/review", "16"])
+    with pytest.raises(HarnessError, match="only valid with /review"):
+        _dispatch(["--all-reviewers", "Implement", "it"])
+    with pytest.raises(SystemExit):
+        _dispatch(["--reviewer", "nope", "/review", "16"])
 
     with pytest.raises(HarnessError, match="Invalid pull request number: abc"):
         _dispatch(["/review", "abc"])
