@@ -18,6 +18,7 @@ ai-harness = "ai_harness.cli:main"
 [dependency-groups]
 dev = [
   "pytest>=8.3,<10",
+  "pytest-cov>=6",
   "ruff>=0.9",
 ]
 
@@ -30,6 +31,14 @@ packages = ["src/ai_harness"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["ai_harness"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+exclude_also = ['if __name__ == "__main__":']
 
 [tool.ruff]
 line-length = 100
