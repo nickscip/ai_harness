@@ -371,6 +371,9 @@ Normal tests use fake providers and temporary Git repositories; they never call 
 GitHub:
 
 ```sh
-uv run --group dev pytest
+uv run --group dev pytest --cov
 uv run --group dev ruff check .
 ```
+
+Coverage must stay at or above 90% (`fail_under` in `pyproject.toml`). CI runs both commands on every
+pull request, and the `test` check is required before merging to `main`.

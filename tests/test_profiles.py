@@ -82,6 +82,8 @@ def _catalog_with(tmp_path: Path, **overrides: object) -> Path:
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
+        ({"critic_model": 5}, "critic_model must be a string"),
+        ({"critic_effort": ["xhigh"]}, "critic_effort must be a string"),
         ({"critic_effort": "turbo"}, "unsupported critic_effort"),
         ({"critic_effort": "max"}, "max critic_effort"),
         ({"critic_fast": "yes"}, "critic_fast must be a boolean"),
