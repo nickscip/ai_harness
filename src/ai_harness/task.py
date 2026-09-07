@@ -25,6 +25,7 @@ from .prompts import (
     task_plan_answer_prompt,
     task_plan_clarify_prompt,
     task_plan_prompt,
+    task_review_feedback_prompt,
     task_review_prompt,
     task_revise_prompt,
 )
@@ -162,6 +163,8 @@ def start_task(
             "claude_fallback_model": config.claude_fallback_model,
             "codex_model": config.codex_model,
             "codex_reasoning": config.codex_reasoning,
+            "codex_fast": config.codex_fast,
+            "apply_review": config.apply_review,
             "claude_max_budget_usd": config.claude_max_budget_usd,
             "deliver": deliver,
             "slack_enabled": config.slack_enabled,
@@ -766,8 +769,12 @@ def _deliver_task(
     repo: GitRepo,
     config: HarnessConfig,
     worktree: Path,
+    revised: dict[str, Any],
     implementation: dict[str, Any],
     verification: dict[str, Any],
+    context: str,
+    context_dirs: tuple[Path, ...],
+    runner: ProviderRunner,
 ) -> dict[str, Any]:
     state = store.load()
     branch = str(state["branch"])
@@ -902,11 +909,100 @@ def _deliver_task(
             store.fail_stage("delivery-review-publication", str(exc))
             raise
 
+    feedback: dict[str, Any] | None = None
+    if config.apply_review and int(review["findings"]) > 0:
+        feedback = _apply_review_feedback(
+            store=store,
+            repo=repo,
+            config=config,
+            runner=runner,
+            worktree=worktree,
+            branch=branch,
+            revised=revised,
+            review=review,
+            context=context,
+            context_dirs=context_dirs,
+        )
+
     return {
         "commit": commit["sha"],
         "pull_request": pull,
         "review": {**review, "publication": publication},
+        "feedback": feedback,
     }
+
+
+def _apply_review_feedback(
+    *,
+    store: RunStore,
+    repo: GitRepo,
+    config: HarnessConfig,
+    runner: ProviderRunner,
+    worktree: Path,
+    branch: str,
+    revised: dict[str, Any],
+    review: dict[str, Any],
+    context: str,
+    context_dirs: tuple[Path, ...],
+) -> dict[str, Any]:
+    """Have the primary family apply the published review's findings and update the pull request."""
+    state = store.load()
+    review_store = RunStore(repo.common_git_dir, str(review["run_id"]), progress=store.progress)
+
+    applied = store.read_completed_stage("review-feedback")
+    if applied is None:
+        applied = runner.run(
+            ProviderRequest(
+                family=state["primary_family"],
+                stage="review-feedback",
+                cwd=worktree,
+                prompt=task_review_feedback_prompt(
+                    state["prompt"],
+                    Path(str(review["review"])),
+                    review_store.root / "review-final.json",
+                    context,
+                ),
+                schema_name="implementation",
+                writable=True,
+                timeout=config.stage_timeout,
+                context_dirs=(*context_dirs, review_store.root),
+                git_admin_dir=repo.git_admin_dir(worktree),
+            )
+        )
+    else:
+        validate_output("implementation", applied)
+    verify_references(store.load())
+
+    delivered = store.read_completed_stage("review-feedback-delivery")
+    if delivered is None:
+        store.begin_stage("review-feedback-delivery", "controller")
+        try:
+            changed = [item.path for item in repo.status(cwd=worktree)]
+            if not changed:
+                # Every finding was argued down rather than fixed. The notes are the record.
+                delivered = {"changed_paths": [], "commit": "", "commands": []}
+            else:
+                command_results = execute_planned_commands(
+                    revised["verification_commands"],
+                    worktree=worktree,
+                    preparation=False,
+                    progress=store.progress,
+                )
+                commit_sha = repo.commit_all(
+                    worktree, "ai-harness: apply pull request review feedback"
+                )
+                repo.push_branch(worktree, branch)
+                delivered = {
+                    "changed_paths": changed,
+                    "commit": commit_sha,
+                    "commands": command_results,
+                }
+            store.complete_stage("review-feedback-delivery", delivered)
+        except Exception as exc:
+            store.fail_stage("review-feedback-delivery", str(exc))
+            raise
+
+    return {"summary": applied["summary"], "notes": applied["notes"], **delivered}
 
 
 def execute_task(
@@ -1181,8 +1277,12 @@ def execute_task(
             repo=repo,
             config=config,
             worktree=worktree,
+            revised=revised,
             implementation=implementation,
             verification=verification,
+            context=context,
+            context_dirs=context_dirs,
+            runner=runner,
         )
 
     final_state = store.load()

@@ -58,3 +58,18 @@ def test_config_command_shows_resolved_models(monkeypatch, capsys) -> None:
     assert "Claude fallback model: sonnet" in output
     assert "Codex model: codex-test-model" in output
     assert "Codex reasoning: medium" in output
+    assert "Codex fast tier: off" in output
+    assert "Apply PR review feedback: off" in output
+
+
+def test_claude_fable_profile_resolves_its_codex_critic_overrides(capsys) -> None:
+    assert _dispatch(["config", "--profile", "claude-fable"]) == 0
+
+    output = capsys.readouterr().out
+    assert "primary family: claude" in output
+    assert "Claude model: fable" in output
+    assert "Claude effort: high" in output
+    assert "Codex model: gpt-5.6-sol" in output
+    assert "Codex reasoning: xhigh" in output
+    assert "Codex fast tier: on" in output
+    assert "Apply PR review feedback: on" in output
