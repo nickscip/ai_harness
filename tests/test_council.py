@@ -86,6 +86,11 @@ def test_every_member_has_a_charter_and_a_schema_slot() -> None:
     assert persona("review_lead").startswith("You are the review lead.")
 
 
+def test_review_lead_persona_states_the_low_severity_floor() -> None:
+    """apply_lead_verdict rejects a retained low-only group, so the lead must be told."""
+    assert "`low` severity" in persona("review_lead")
+
+
 def test_council_spans_both_families_and_names_stages_stably() -> None:
     families = {member: member_family(member, "claude") for member in CANONICAL_ORDER}
     assert set(families.values()) == {"claude", "codex"}

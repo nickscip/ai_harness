@@ -1,18 +1,52 @@
 from __future__ import annotations
 
 import json
+import subprocess
+from functools import cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .errors import HarnessError
 from .process import CommandResult, controller_env, run_command
 
 
-def _github_env() -> dict[str, str]:
+@cache
+def _origin_host(repo: Path) -> str:
+    """The host in this repository's origin URL, or "" when it cannot be read.
+
+    Read directly rather than through run_command: this is a local read-only query,
+    not a controller subprocess, and it must not consume a gh call's turn.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+    url = result.stdout.strip()
+    if "://" in url:
+        return urlsplit(url).hostname or ""
+    return url.rpartition("@")[2].partition(":")[0]
+
+
+def _github_env(repo: Path) -> dict[str, str]:
     environment = controller_env()
-    # A shell-wide GH_HOST can point at a different GitHub Enterprise instance.
-    # Let gh infer the correct host from this repository's origin instead.
-    environment.pop("GH_HOST", None)
+    # A shell-wide GH_HOST can point at a different GitHub Enterprise instance, and
+    # `gh api` with an explicit repos/ path never infers the host from origin the way
+    # `gh repo view` does. Pin it to this repository's own origin host.
+    host = _origin_host(repo)
+    if host:
+        environment["GH_HOST"] = host
+    else:
+        environment.pop("GH_HOST", None)
     return environment
 
 
@@ -24,7 +58,7 @@ def _gh_json(
         cwd=repo,
         timeout=timeout,
         input_text=input_text,
-        env=_github_env(),
+        env=_github_env(repo),
     )
     try:
         return json.loads(result.stdout)
@@ -152,6 +186,6 @@ def post_review(
         cwd=repo,
         timeout=120,
         input_text=json.dumps(payload),
-        env=_github_env(),
+        env=_github_env(repo),
         check=False,
     )

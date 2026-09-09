@@ -60,6 +60,9 @@ Produce the smallest actionable review:
    place, prefer a pointer to the canonical source. Retain such a finding only where it shows
    a currently missing, stale, or contradictory source.
 
+8. Dismiss any group whose strongest finding is `low` severity, with reason `trivial`. The
+   published review carries `medium` and above only; a retained low-severity group is rejected.
+
 Assign every source ID exactly once, to one accepted group or one dismissed group. Never
 invent a source ID, never split one source across decisions, and never omit one. Do not
 restate a source's severity, path, line, excerpt, or verification — the controller selects

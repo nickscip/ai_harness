@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from ai_harness.errors import HarnessError
 from ai_harness.github import (
+    _github_env,
     create_draft_pull_request,
     open_pull_request_for_head,
     post_review,
@@ -29,6 +31,36 @@ def test_gh_infers_host_from_remote_instead_of_shell_override(
     monkeypatch.setattr("ai_harness.github.run_command", fake_run_command)
 
     assert repository_name(tmp_path) == "owner/repo"
+
+
+def _git_repo_with_origin(path: Path, url: str) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "--quiet"], cwd=path, check=True)
+    subprocess.run(["git", "remote", "add", "origin", url], cwd=path, check=True)
+    return path
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("git@git.enterprise.example:owner/repo.git", "git.enterprise.example"),
+        ("https://git.enterprise.example/owner/repo.git", "git.enterprise.example"),
+    ],
+)
+def test_gh_env_pins_host_from_origin_over_shell_override(
+    tmp_path: Path, monkeypatch, url: str, expected: str
+) -> None:
+    """`gh api repos/...` never infers the host, so it must be pinned from origin."""
+    monkeypatch.setenv("GH_HOST", "wrong.example")
+    repo = _git_repo_with_origin(tmp_path / expected.replace(".", "_") / url[:3], url)
+
+    assert _github_env(repo)["GH_HOST"] == expected
+
+
+def test_gh_env_drops_shell_host_when_origin_is_unreadable(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("GH_HOST", "wrong.example")
+
+    assert "GH_HOST" not in _github_env(tmp_path / "not-a-repo")
 
 
 def _fake_gh(monkeypatch, responses: list[object]) -> list[dict[str, object]]:
